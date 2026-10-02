@@ -68,7 +68,7 @@ The shortcuts run `powershell.exe -ExecutionPolicy Bypass -File <script>`. This 
 ## Processes it starts or stops
 
 - **Starts:** `claude.exe --version`, found on `PATH` or in `~/.local/bin`, only when automatic login renewal is on and a renewal is due, to read the installed version (at most every 6 hours). It's started without a shell or window, with its input closed, and given at most 15 seconds.
-- **Starts:** `codex.exe app-server --stdio`, found on `PATH`, in the Codex desktop app's folder, or in the npm global install. It's started without a shell, given at most 20 seconds and 4 MB of output, then stopped.
+- **Starts:** `codex.exe app-server --stdio`, found on `PATH`, in the Codex desktop app's folder, or in the npm global install. It's started without a shell, given at most 30 seconds and 4 MB of output, then stopped. If it stalls or Codex can't reach its server, it's tried once more (at most 20 seconds).
 - **Stops:** `-Install` and `-Uninstall` first signal a running widget to exit. If it doesn't, they stop only PowerShell processes whose command line contains the installed script's path.
 
 ## Reporting a vulnerability

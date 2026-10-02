@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 (2026-10-03)
+
+- **Strip on every monitor (optional).** New menu item **Show on all taskbars** (setting `StripAllTaskbars`, off by default): the strip also appears on the taskbars of your other monitors, left of their clock area.
+- **Strip fits short taskbars.** On Windows 10's default taskbar or with small taskbar buttons, the bars now scale down instead of being cut off.
+- **Steadier Codex numbers.** The live Codex query waits up to 30 seconds (was 20) and is retried once at once when it stalls or Codex can't reach its server, before falling back to "from logs". `widget.log` now says which step failed and after how long.
+- **Docs:** Windows 10 compatibility notes; Windows 10 needs version 1809 or newer.
+
 ## 1.3.2 (2026-10-03)
 
 - **Fix:** `-Snapshot` cut the widget's right and bottom edges off. The README screenshots are re-rendered with the whole card.

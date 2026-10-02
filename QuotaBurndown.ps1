@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.3.2'
+$AppVersion = '1.4.0'
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -81,6 +81,7 @@ $DefaultSettings = [ordered]@{
     Visible               = $true
     StripVisible          = $true
     StripOffset           = 8       # gap (DIP) between the taskbar strip and the tray area
+    StripAllTaskbars      = $false  # also show the strip on the other monitors' taskbars
     ClaudeRefreshMinutes  = 15      # the Claude usage endpoint rate-limits hard; keep this >= 10
     CodexRefreshMinutes   = 3
     ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
@@ -106,7 +107,7 @@ function Read-Settings {
         } catch { }
     }
     # The file is hand-editable: never trust its types or ranges.
-    foreach ($k in 'Topmost', 'Visible', 'StripVisible') { if ($s[$k] -isnot [bool]) { $s[$k] = $DefaultSettings[$k] } }
+    foreach ($k in 'Topmost', 'Visible', 'StripVisible', 'StripAllTaskbars') { if ($s[$k] -isnot [bool]) { $s[$k] = $DefaultSettings[$k] } }
     foreach ($k in 'ClaudeAutoRenewLogin', 'CheckForUpdates') { if ($s[$k] -isnot [bool]) { $s[$k] = $null } }   # opt-in: anything else means "not asked"
     $s.Left = ConvertTo-Number $s.Left $null -100000 100000
     $s.Top = ConvertTo-Number $s.Top $null -100000 100000
@@ -536,7 +537,11 @@ $DataLayer = {
         $null
     }
 
-    function Get-CodexLive([string]$Exe) {
+    # One live query. Errors say which step stalled and after how long, so a
+    # timeout in widget.log can be told apart from a network failure inside Codex.
+    function Get-CodexLive([string]$Exe, [int]$TimeoutSec = 30) {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $step = 'starting'
         $psi = [Diagnostics.ProcessStartInfo]::new($Exe, 'app-server --stdio')
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
@@ -550,21 +555,25 @@ $DataLayer = {
             $p.StandardInput.NewLine = "`n"
             $p.StandardInput.AutoFlush = $true
             $p.StandardInput.WriteLine('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"quota-burndown","version":"' + $AppVersion + '"}}}')
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            $step = 'initialize'
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
             $received = 0
             while ($true) {
                 $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
-                if ($left -le 0) { throw 'Codex app-server timed out' }
-                $t = $p.StandardOutput.ReadLineAsync()
-                if (-not $t.Wait($left)) { throw 'Codex app-server timed out' }
+                $t = if ($left -gt 0) { $p.StandardOutput.ReadLineAsync() }
+                if ($left -le 0 -or -not $t.Wait($left)) { throw ('Codex app-server timed out after {0:0}s waiting for {1}' -f $sw.Elapsed.TotalSeconds, $step) }
                 $line = $t.Result
-                if ($null -eq $line) { throw 'Codex app-server exited before replying' }
+                if ($null -eq $line) {
+                    $code = if ($p.WaitForExit(500)) { $p.ExitCode } else { '?' }
+                    throw ('Codex app-server exited (code {0}) after {1:0.0}s during {2}' -f $code, $sw.Elapsed.TotalSeconds, $step)
+                }
                 $received += $line.Length
                 if ($received -gt 4MB) { throw 'Codex app-server sent too much data' }
                 if (-not $line.StartsWith('{')) { continue }
                 try { $m = $line | ConvertFrom-Json } catch { continue }
                 if ($m.id -eq 1) {
                     if ($m.error) { throw 'Codex app-server initialization failed' }
+                    $step = 'rate limits'
                     $p.StandardInput.WriteLine('{"method":"initialized"}')
                     $p.StandardInput.WriteLine('{"id":2,"method":"account/rateLimits/read","params":null}')
                 } elseif ($m.id -eq 2) {
@@ -640,8 +649,20 @@ $DataLayer = {
         $liveError = $null
         $exe = Find-CodexExe
         if ($exe) {
+            # A stalled app-server or a network blip inside Codex usually clears at once:
+            # retry one time, quickly. A real error answer from Codex is not retried.
+            $live = $null; $causes = @()
+            for ($attempt = 1; $attempt -le 2 -and -not $live; $attempt++) {
+                try { $live = Get-CodexLive $exe $(if ($attempt -eq 1) { 30 } else { 20 }) }
+                catch {
+                    $causes += $_.Exception.Message
+                    if ($attempt -eq 1 -and $_.Exception.Message -match 'timed out|exited|error sending request|failed to fetch') { Start-Sleep -Milliseconds 1500 }
+                    else { break }
+                }
+            }
+            if ($live -and $causes.Count) { Write-WidgetLog ('Codex: live query worked on the second try. First try: ' + $causes[0]) }
             try {
-                $live = Get-CodexLive $exe
+                if (-not $live) { throw ($causes -join '; retry: ') }
                 $rl = $live.rateLimits
                 if (-not $rl -and $live.rateLimitsByLimitId) { $rl = $live.rateLimitsByLimitId.codex }
                 if (-not $rl) { throw 'Codex returned no rate limits' }
@@ -1658,14 +1679,14 @@ function Add-ProviderSection($r, [bool]$First) {
         ShowInTaskbar="False" ResizeMode="NoResize" SizeToContent="Width" Height="48" Topmost="True"
         ShowActivated="False" FontFamily="Segoe UI Variable Text, Segoe UI" UseLayoutRounding="True">
   <Border x:Name="StripCard" CornerRadius="6" Padding="6,0" Margin="0,4" ToolTipService.InitialShowDelay="250">
-    <StackPanel x:Name="StripRows" Orientation="Horizontal" VerticalAlignment="Center"/>
+    <Viewbox StretchDirection="DownOnly" VerticalAlignment="Center">
+      <StackPanel x:Name="StripRows" Orientation="Horizontal" VerticalAlignment="Center"/>
+    </Viewbox>
   </Border>
 </Window>
 "@
-$strip = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($stripXaml))
-$stripCard = $strip.FindName('StripCard')
-$stripRows = $strip.FindName('StripRows')
-$stripCard.Background = $HitBrush
+# The Viewbox only ever shrinks the bars: on a short taskbar (Windows 10, or small
+# taskbar buttons) they scale down to fit instead of being cut off.
 $SignalHeight = 22.0
 $SignalWidth = 6.0
 $SignalUsed = $SB.Bad                                                             # red = used
@@ -1711,7 +1732,7 @@ function New-SignalBar($w, [DateTimeOffset]$Now, [string]$Label, $LabelBrush, [s
 
 function Update-Strip {
     $now = [DateTimeOffset]::UtcNow
-    $stripRows.Children.Clear()
+    foreach ($s in $script:strips) { $s.Rows.Children.Clear() }
     $tips = @()
     $first = $true
     foreach ($r in @($sync.Claude, $sync.Codex)) {
@@ -1719,15 +1740,19 @@ function Update-Strip {
         $wins = @($r.Windows)
         $tone = if ($r.Name -eq 'Claude Code') { $SB.Claude } else { $SB.Text }
         if ($r.Error -and $wins.Count -eq 0) { $tone = $SB.Warn }
-        $pair = [Windows.Controls.StackPanel]::new(); $pair.Orientation = 'Horizontal'; $pair.VerticalAlignment = 'Center'
-        if (-not $first) { $pair.Margin = '5,0,0,0' }
-        $first = $false
-        foreach ($spec in @(@('5h', ($wins | Where-Object { $_.Minutes -eq 300 } | Select-Object -First 1)), @('7d', ($wins | Where-Object { $_.Label -eq 'Weekly' } | Select-Object -First 1)))) {
-            $w = $spec[1]
-            $f = if ($w) { Get-Derived 'Forecast' $r.Name $w.Label }
-            $null = $pair.Children.Add((New-SignalBar $w $now $spec[0] $tone $(if ($f) { $f.Level } else { 'ok' })))
+        $specs = @(@('5h', ($wins | Where-Object { $_.Minutes -eq 300 } | Select-Object -First 1)), @('7d', ($wins | Where-Object { $_.Label -eq 'Weekly' } | Select-Object -First 1)))
+        foreach ($s in $script:strips) {
+            # WPF elements can have only one parent: every strip gets its own bars.
+            $pair = [Windows.Controls.StackPanel]::new(); $pair.Orientation = 'Horizontal'; $pair.VerticalAlignment = 'Center'
+            if (-not $first) { $pair.Margin = '5,0,0,0' }
+            foreach ($spec in $specs) {
+                $w = $spec[1]
+                $f = if ($w) { Get-Derived 'Forecast' $r.Name $w.Label }
+                $null = $pair.Children.Add((New-SignalBar $w $now $spec[0] $tone $(if ($f) { $f.Level } else { 'ok' })))
+            }
+            $null = $s.Rows.Children.Add($pair)
         }
-        $null = $stripRows.Children.Add($pair)
+        $first = $false
 
         $tips += $r.Name + $(if ($r.Plan) { " ($($r.Plan))" })
         foreach ($w in $wins) {
@@ -1747,20 +1772,56 @@ function Update-Strip {
     $tips += '5h = 5-hour window, 7d = weekly. Orange labels = Claude Code, white = Codex.'
     $tips += 'Red = used, grey = remaining, white line = even pace. Red label = runs out before the reset; amber outline = tight.'
     $tips += 'Click to ' + $(if ($window.IsVisible) { 'hide' } else { 'show' }) + ' the widget; drag to move.'
-    $stripCard.ToolTip = $tips -join "`n"
+    foreach ($s in $script:strips) { $s.Card.ToolTip = $tips -join "`n" }
 }
 
-$script:stripHwnd = [IntPtr]::Zero
-$script:stripSource = $null
+# One strip window per taskbar it sits on. Event handlers find their strip in the
+# window's Tag, because they run after this function has returned.
+function New-StripWindow {
+    $w = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($stripXaml))
+    $s = @{ Window = $w; Card = $w.FindName('StripCard'); Rows = $w.FindName('StripRows'); Hwnd = [IntPtr]::Zero; Source = $null }
+    $w.Tag = $s
+    $s.Card.Background = $HitBrush
+    # Click toggles the widget, drag slides the strip along the taskbar.
+    $w.Add_MouseEnter({ param($o, $e) $o.Tag.Card.Background = $SB.Hover })
+    $w.Add_MouseLeave({ param($o, $e) $o.Tag.Card.Background = $HitBrush })
+    $w.Add_MouseLeftButtonDown({
+            param($o, $e)
+            $script:stripDrag = @{ X = [Windows.Forms.Cursor]::Position.X; Offset = [double]$Settings.StripOffset; Moved = $false; Strip = $o.Tag }
+            $null = $o.CaptureMouse()
+        })
+    $w.Add_MouseMove({
+            if (-not $script:stripDrag -or -not $script:stripDrag.Strip.Source) { return }
+            $dxPx = [Windows.Forms.Cursor]::Position.X - $script:stripDrag.X
+            if ([Math]::Abs($dxPx) -lt 4 -and -not $script:stripDrag.Moved) { return }
+            $script:stripDrag.Moved = $true
+            $dx = $script:stripDrag.Strip.Source.CompositionTarget.TransformFromDevice.Transform([Windows.Point]::new($dxPx, 0)).X
+            $Settings.StripOffset = $script:stripDrag.Offset - $dx
+            Update-StripPlacement
+        })
+    $w.Add_MouseLeftButtonUp({
+            param($o, $e)
+            $drag = $script:stripDrag
+            $script:stripDrag = $null
+            $o.ReleaseMouseCapture()
+            if (-not $drag) { return }
+            if ($drag.Moved) { Save-Settings $Settings } else { Show-Widget (-not $window.IsVisible) }
+        })
+    $w.Add_MouseRightButtonUp({ $menu.Show([Windows.Forms.Cursor]::Position) })
+    $s
+}
 
-function Initialize-StripWindow {
-    $helper = [Windows.Interop.WindowInteropHelper]::new($strip)
-    $script:stripHwnd = $helper.EnsureHandle()
-    $script:stripSource = [Windows.Interop.HwndSource]::FromHwnd($script:stripHwnd)
+function Initialize-StripWindow($s) {
+    $s.Hwnd = [Windows.Interop.WindowInteropHelper]::new($s.Window).EnsureHandle()
+    $s.Source = [Windows.Interop.HwndSource]::FromHwnd($s.Hwnd)
     # Tool window (no Alt+Tab entry) that never takes focus from the app you are using.
-    $ex = [QuotaBurndown.Native]::GetWindowLong($script:stripHwnd, -20)
-    $null = [QuotaBurndown.Native]::SetWindowLong($script:stripHwnd, -20, ($ex -bor 0x80 -bor 0x08000000))
+    $ex = [QuotaBurndown.Native]::GetWindowLong($s.Hwnd, -20)
+    $null = [QuotaBurndown.Native]::SetWindowLong($s.Hwnd, -20, ($ex -bor 0x80 -bor 0x08000000))
 }
+
+$script:strips = New-Object System.Collections.ArrayList
+$null = $script:strips.Add((New-StripWindow))
+$stripCard = $script:strips[0].Card   # the main taskbar's strip, as rendered by -Snapshot
 
 function Get-Rect([IntPtr]$h) {
     $r = New-Object QuotaBurndown.Native+RECT
@@ -1778,64 +1839,77 @@ function Test-FullscreenForeground($Screen) {
     $r -and $r.Left -le $Screen.Left -and $r.Top -le $Screen.Top -and $r.Right -ge $Screen.Right -and $r.Bottom -ge $Screen.Bottom
 }
 
+# The main taskbar, then (when "Show on all taskbars" is on) the other monitors' taskbars.
+function Get-Taskbars {
+    $list = @()
+    $main = [QuotaBurndown.Native]::FindWindow('Shell_TrayWnd', $null)
+    if ($main -ne [IntPtr]::Zero) { $list += $main }
+    if ($Settings.StripAllTaskbars) {
+        $h = [IntPtr]::Zero
+        for ($i = 0; $i -lt 8; $i++) {
+            $h = [QuotaBurndown.Native]::FindWindowEx([IntPtr]::Zero, $h, 'Shell_SecondaryTrayWnd', $null)
+            if ($h -eq [IntPtr]::Zero) { break }
+            $list += $h
+        }
+    }
+    , $list
+}
+
 function Update-StripPlacement {
-    $show = [bool]$Settings.StripVisible
-    $tb = [QuotaBurndown.Native]::FindWindow('Shell_TrayWnd', $null)
-    $tr = if ($tb -ne [IntPtr]::Zero) { Get-Rect $tb } else { $null }
-    if (-not $tr) { $show = $false }
+    $bars = if ($Settings.StripVisible) { Get-Taskbars } else { @() }
+    $want = [Math]::Max(1, $bars.Count)
+    $added = $false
+    while ($script:strips.Count -lt $want) { $null = $script:strips.Add((New-StripWindow)); $added = $true }
+    for ($i = $script:strips.Count - 1; $i -ge $want; $i--) {
+        if ($script:stripDrag -and $script:stripDrag.Strip -eq $script:strips[$i]) { $script:stripDrag = $null }
+        $script:strips[$i].Window.Close(); $script:strips.RemoveAt($i)
+    }
+    if ($added) { Update-Strip }
+    for ($i = 0; $i -lt $script:strips.Count; $i++) {
+        $tb = if ($i -lt $bars.Count) { $bars[$i] } else { [IntPtr]::Zero }
+        Set-StripPosition $script:strips[$i] $tb ($i -eq 0)
+    }
+}
+
+function Set-StripPosition($s, [IntPtr]$Taskbar, [bool]$Main) {
+    $w = $s.Window
+    $tr = if ($Taskbar -ne [IntPtr]::Zero) { Get-Rect $Taskbar } else { $null }
+    $show = [bool]$tr
     if ($show) {
-        $screen = [Windows.Forms.Screen]::FromHandle($tb).Bounds
+        $screen = [Windows.Forms.Screen]::FromHandle($Taskbar).Bounds
         $horizontal = ($tr.Right - $tr.Left) -gt ($tr.Bottom - $tr.Top)
         $onScreen = ($tr.Bottom - $tr.Top) -gt 16 -and $tr.Top -lt $screen.Bottom - 8 -and $tr.Bottom -gt $screen.Top + 8
         if (-not $horizontal -or -not $onScreen -or (Test-FullscreenForeground $screen)) { $show = $false }
     }
-    if (-not $show) { if ($strip.IsVisible) { $strip.Hide() }; return }
+    if (-not $show) { if ($w.IsVisible) { $w.Hide() }; return }
+    if (-not $s.Source) { Initialize-StripWindow $s }
 
-    $notify = [QuotaBurndown.Native]::FindWindowEx($tb, [IntPtr]::Zero, 'TrayNotifyWnd', $null)
+    $m = $s.Source.CompositionTarget.TransformFromDevice
+    # Left of the tray icons (TrayNotifyWnd: the main taskbar on Windows 10 and 11).
+    # A secondary taskbar has no tray icons, at most the clock: leave room for that.
+    $notify = [QuotaBurndown.Native]::FindWindowEx($Taskbar, [IntPtr]::Zero, 'TrayNotifyWnd', $null)
     $nr = if ($notify -ne [IntPtr]::Zero) { Get-Rect $notify } else { $null }
-    $anchorPx = if ($nr -and $nr.Left -gt $tr.Left) { $nr.Left } else { $tr.Right - 360 }
+    $anchorPx = if ($nr -and $nr.Left -gt $tr.Left) { $nr.Left }
+                elseif ($Main) { $tr.Right - 360 }
+                else { $tr.Right - [int](130 / [Math]::Max(0.1, $m.M11)) }
 
-    $m = $script:stripSource.CompositionTarget.TransformFromDevice
     $topLeft = $m.Transform([Windows.Point]::new($tr.Left, $tr.Top))
     $bottom = $m.Transform([Windows.Point]::new($tr.Right, $tr.Bottom))
     $anchor = $m.Transform([Windows.Point]::new($anchorPx, $tr.Top)).X
 
     $height = $bottom.Y - $topLeft.Y
-    $width = if ($strip.ActualWidth -gt 0) { $strip.ActualWidth } else { 60 }
+    $width = if ($w.ActualWidth -gt 0) { $w.ActualWidth } else { 60 }
     $left = $anchor - $width - [double]$Settings.StripOffset
     $left = [Math]::Max($topLeft.X, [Math]::Min($bottom.X - $width, $left))
-    if ([Math]::Abs($strip.Height - $height) -gt 0.5) { $strip.Height = $height }
-    if ([Math]::Abs($strip.Top - $topLeft.Y) -gt 0.5) { $strip.Top = $topLeft.Y }
-    if ([Math]::Abs($strip.Left - $left) -gt 0.5) { $strip.Left = $left }
-    if (-not $strip.IsVisible) { $strip.Show() }
+    if ([Math]::Abs($w.Height - $height) -gt 0.5) { $w.Height = $height }
+    if ([Math]::Abs($w.Top - $topLeft.Y) -gt 0.5) { $w.Top = $topLeft.Y }
+    if ([Math]::Abs($w.Left - $left) -gt 0.5) { $w.Left = $left }
+    if (-not $w.IsVisible) { $w.Show() }
     # Clicking the taskbar raises it above us; put the strip back on top without stealing focus.
-    $null = [QuotaBurndown.Native]::SetWindowPos($script:stripHwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0013)
+    $null = [QuotaBurndown.Native]::SetWindowPos($s.Hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0013)
 }
 
-# Click toggles the widget, drag slides the strip along the taskbar.
 $script:stripDrag = $null
-$strip.Add_MouseEnter({ $stripCard.Background = $SB.Hover })
-$strip.Add_MouseLeave({ $stripCard.Background = $HitBrush })
-$strip.Add_MouseLeftButtonDown({
-        $script:stripDrag = @{ X = [Windows.Forms.Cursor]::Position.X; Offset = [double]$Settings.StripOffset; Moved = $false }
-        $null = $strip.CaptureMouse()
-    })
-$strip.Add_MouseMove({
-        if (-not $script:stripDrag) { return }
-        $dxPx = [Windows.Forms.Cursor]::Position.X - $script:stripDrag.X
-        if ([Math]::Abs($dxPx) -lt 4 -and -not $script:stripDrag.Moved) { return }
-        $script:stripDrag.Moved = $true
-        $dx = $script:stripSource.CompositionTarget.TransformFromDevice.Transform([Windows.Point]::new($dxPx, 0)).X
-        $Settings.StripOffset = $script:stripDrag.Offset - $dx
-        Update-StripPlacement
-    })
-$strip.Add_MouseLeftButtonUp({
-        $drag = $script:stripDrag
-        $script:stripDrag = $null
-        $strip.ReleaseMouseCapture()
-        if (-not $drag) { return }
-        if ($drag.Moved) { Save-Settings $Settings } else { Show-Widget (-not $window.IsVisible) }
-    })
 
 # ----- tray icon -------------------------------------------------------------
 
@@ -1902,9 +1976,10 @@ $miRefresh = $menu.Items.Add('Refresh now')
 $null = $menu.Items.Add('-')
 $miTop = [Windows.Forms.ToolStripMenuItem]::new('Always on top')
 $miStrip = [Windows.Forms.ToolStripMenuItem]::new('Show on taskbar')
+$miStripAll = [Windows.Forms.ToolStripMenuItem]::new('Show on all taskbars')
 $miStripReset = [Windows.Forms.ToolStripMenuItem]::new('Reset taskbar position')
 $miStart = [Windows.Forms.ToolStripMenuItem]::new('Start with Windows')
-foreach ($mi in $miTop, $miStrip, $miStripReset, $miStart) { $null = $menu.Items.Add($mi) }
+foreach ($mi in $miTop, $miStrip, $miStripAll, $miStripReset, $miStart) { $null = $menu.Items.Add($mi) }
 $null = $menu.Items.Add('-')
 $miRenew = [Windows.Forms.ToolStripMenuItem]::new('Renew Claude login automatically')
 $miRenew.ToolTipText = "Renews an expired Claude Code login the way Claude Code does. Unofficial; see SECURITY.md."
@@ -1920,6 +1995,8 @@ $menu.Add_Opening({
         $miTop.Checked = $window.Topmost
         $miStrip.Checked = [bool]$Settings.StripVisible
         $miStripReset.Enabled = [bool]$Settings.StripVisible
+        $miStripAll.Checked = [bool]$Settings.StripAllTaskbars
+        $miStripAll.Enabled = [bool]$Settings.StripVisible
         $miStart.Checked = Test-Path $StartupLink
         $miRenew.Checked = [bool]$Settings.ClaudeAutoRenewLogin
         $miUpdates.Checked = [bool]$Settings.CheckForUpdates
@@ -1942,6 +2019,7 @@ $miShow.Add_Click({ Show-Widget (-not $window.IsVisible) })
 $miRefresh.Add_Click({ Request-Refresh })
 $miTop.Add_Click({ $window.Topmost = -not $window.Topmost; $Settings.Topmost = $window.Topmost; Save-Settings $Settings })
 $miStrip.Add_Click({ $Settings.StripVisible = -not $Settings.StripVisible; Save-Settings $Settings; Update-StripPlacement })
+$miStripAll.Add_Click({ $Settings.StripAllTaskbars = -not $Settings.StripAllTaskbars; Save-Settings $Settings; Update-StripPlacement })
 $miStripReset.Add_Click({ $Settings.StripOffset = 8; Save-Settings $Settings; Update-StripPlacement })
 $miStart.Add_Click({ try { Set-Autostart (-not (Test-Path $StartupLink)) } catch { Write-WidgetLog "Autostart: $_" } })
 $miData.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $DataDir) })
@@ -1957,7 +2035,6 @@ $window.Add_MouseLeftButtonDown({
         Save-Position
     })
 $window.Add_MouseRightButtonUp({ $menu.Show([Windows.Forms.Cursor]::Position) })
-$strip.Add_MouseRightButtonUp({ $menu.Show([Windows.Forms.Cursor]::Position) })
 
 $window.Add_Loaded({
         $vl = [Windows.SystemParameters]::VirtualScreenLeft; $vt = [Windows.SystemParameters]::VirtualScreenTop
@@ -2041,7 +2118,6 @@ if ($Snapshot) {
     return
 }
 
-Initialize-StripWindow
 Update-View
 $tray.Visible = $true
 $timer.Start()

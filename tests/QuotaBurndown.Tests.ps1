@@ -144,6 +144,51 @@ Describe 'Get-WindowForecast' {
     }
 }
 
+Describe 'Update-Codex retry' {
+    BeforeEach {
+        # Stand-ins, defined in the test's scope so Update-Codex calls them instead.
+        $script:calls = 0
+        $script:logged = @()
+        function Find-CodexExe { 'codex.exe' }
+        function Write-WidgetLog([string]$Message) { $script:logged += $Message }
+        function Get-CodexFromLogs { $null }
+        function New-LiveAnswer {
+            [pscustomobject]@{ rateLimits = [pscustomobject]@{
+                    planType = 'plus'
+                    primary  = [pscustomobject]@{ windowDurationMins = 300; usedPercent = 12; resetsAt = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeSeconds() }
+                } }
+        }
+    }
+
+    It 'retries once after a stall and uses the second answer' {
+        function Get-CodexLive([string]$Exe, [int]$TimeoutSec) {
+            $script:calls++
+            if ($script:calls -eq 1) { throw 'Codex app-server timed out after 30s waiting for rate limits' }
+            New-LiveAnswer
+        }
+        $r = (Update-Codex 3).Result
+        $script:calls | Should -Be 2
+        $r.Source | Should -Be 'live'
+        $r.Windows[0].Percent | Should -Be 12
+        $script:logged -join ' ' | Should -Match 'second try.*timed out after 30s waiting for rate limits'
+    }
+
+    It 'does not retry a real error answer from Codex' {
+        function Get-CodexLive([string]$Exe, [int]$TimeoutSec) { $script:calls++; throw 'Codex rate-limit request failed: not signed in' }
+        $r = (Update-Codex 3).Result
+        $script:calls | Should -Be 1
+        $r.Error | Should -Be 'unavailable'
+        $r.Detail | Should -Match 'not signed in'
+    }
+
+    It 'reports both causes when the retry fails too' {
+        function Get-CodexLive([string]$Exe, [int]$TimeoutSec) { $script:calls++; throw "Codex app-server exited (code 1) after 0.2s during initialize" }
+        $r = (Update-Codex 3).Result
+        $script:calls | Should -Be 2
+        $r.Detail | Should -Match 'exited.*retry: .*exited'
+    }
+}
+
 Describe 'Read-Settings' {
     BeforeEach { $SettingsPath = Join-Path $TestDrive 'settings.json' }
     AfterEach { Remove-Item $SettingsPath -ErrorAction SilentlyContinue }
@@ -154,6 +199,7 @@ Describe 'Read-Settings' {
         $s.Topmost | Should -BeTrue
         $s.ClaudeAutoRenewLogin | Should -BeNullOrEmpty
         $s.CheckForUpdates | Should -BeNullOrEmpty
+        $s.StripAllTaskbars | Should -BeFalse
     }
 
     It 'returns the defaults when the file is not JSON' {

@@ -67,7 +67,7 @@ What Quota Burndown adds: the **even-pace target** for every window, a **run-out
 
 ## Requirements
 
-- Windows 10 or 11.
+- Windows 11, or Windows 10 version 1809 or newer.
 - **Claude Code**, signed in with a Claude subscription (Pro or Max), for the Claude Code numbers.
 - **Codex**, signed in with ChatGPT (the Codex desktop app, or the CLI from npm or elsewhere on `PATH`), for the Codex numbers.
 
@@ -145,6 +145,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 - Refresh now
 - Always on top
 - Show on taskbar
+- Show on all taskbars (also on other monitors' taskbars)
 - Reset taskbar position
 - Start with Windows
 - Renew Claude login automatically
@@ -200,6 +201,7 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 | `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
+| `StripAllTaskbars` | `false` | Also show the strip on the other monitors' taskbars; also in the menu |
 | `Left`, `Top` | saved automatically | Widget position |
 
 ## Files
@@ -231,7 +233,8 @@ See [SECURITY.md](SECURITY.md). In short:
 - **"login expired" with a retry time** (automatic renewal on): renewal was rate-limited. The widget retries on its own; hover over the status for the next attempt time.
 - **"rate limited":** the Claude usage endpoint asked to wait. The widget keeps showing the last values and retries after the requested time.
 - **Codex "not found":** install the Codex desktop app, or make sure `codex.exe` is on `PATH`.
-- **Codex shows "from logs":** the live query failed; you're seeing the latest values recorded in your Codex session logs.
+- **Codex shows "from logs":** the live query failed twice in a row (it retries once at once); you're seeing the latest values recorded in your Codex session logs. Hover over the status for the reason. `widget.log` says which step failed and after how long, for example "timed out after 30s waiting for rate limits" (Codex itself didn't answer) or "error sending request" (Codex couldn't reach its server).
+- **Strip missing on a second monitor:** tick **Show on all taskbars**. On a secondary taskbar the strip sits left of the clock area; drag it if it covers something.
 - **Nothing on the taskbar:** check **Show on taskbar** in the menu. The strip hides when the taskbar is auto-hidden or vertical, and when a fullscreen app is in front.
 - **Anything else:** check `widget.log` (menu → **Open data folder**).
 
@@ -279,7 +282,16 @@ No, it uses Windows-only parts (WPF, the taskbar). See [Alternatives](#alternati
 | PowerShell | Windows PowerShell 5.1 for the widget; the automated tests also run on PowerShell 7 |
 | Taskbar | at the bottom, dark theme, single monitor |
 
-Not tested yet: Windows 10, x64 PCs for the widget itself (the automated tests run on x64), a taskbar on a second monitor, a light taskbar on a real screen (only in rendered previews), and top or side taskbars (the strip hides itself when the taskbar is vertical). Reports are welcome.
+Not tested yet: x64 PCs for the widget itself (the automated tests run on x64), taskbars on a second monitor (**Show on all taskbars**), a light taskbar on a real screen (only in rendered previews), and top taskbars. The strip hides itself when the taskbar is vertical. Reports are welcome.
+
+### Windows 10
+
+Reviewed in the code, not yet tested on a real Windows 10 PC:
+
+- **Strip placement** works the same way: Windows 10's taskbar has the same tray area (`TrayNotifyWnd`) that the strip lines up against.
+- **Short taskbars:** the default Windows 10 taskbar (40 px) and small taskbar buttons (30 px) are shorter than Windows 11's. The bars scale down to fit, so they get smaller there.
+- **Fonts and icons:** Windows 11's Segoe UI Variable and Segoe Fluent Icons fall back to Segoe UI and Segoe MDL2 Assets, which include the same icons.
+- **Start menu shortcut:** it uses `conhost --headless` to hide the console window, which needs Windows 10 version 1809 or newer.
 
 ## Development
 
