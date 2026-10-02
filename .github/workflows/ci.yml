@@ -36,6 +36,8 @@ jobs:
       - name: Install test modules
         run: |
           if ($PSVersionTable.PSEdition -ne 'Core') { $null = Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser }
+          # Some runner images come without the gallery registered.
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) { Register-PSRepository -Default }
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
