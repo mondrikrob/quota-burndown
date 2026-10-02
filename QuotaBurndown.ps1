@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.3.0'
+$AppVersion = '1.3.1'
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -131,7 +131,7 @@ $DataLayer = {
 
     function Get-DataFile([string]$Name) { Join-Path (Join-Path $HOME '.quota-burndown') $Name }
 
-    function Write-Log([string]$Message) {
+    function Write-WidgetLog([string]$Message) {
         try {
             $path = Get-DataFile 'widget.log'
             if ((Test-Path $path) -and (Get-Item $path).Length -gt 512KB) { Remove-Item $path -Force }
@@ -373,8 +373,8 @@ $DataLayer = {
             try { $saved = Save-ClaudeTokens $CredPath $refresh $access $newRefresh $expiresAtMs; break }
             catch { Start-Sleep -Milliseconds 200 }
         }
-        if ($saved) { Write-Log ('Renewed the Claude Code login (valid until {0:HH:mm}).' -f [DateTimeOffset]::FromUnixTimeMilliseconds($expiresAtMs).LocalDateTime) }
-        else { Write-Log 'Renewed the Claude Code login but did not save it (the credentials file changed or was locked).' }
+        if ($saved) { Write-WidgetLog ('Renewed the Claude Code login (valid until {0:HH:mm}).' -f [DateTimeOffset]::FromUnixTimeMilliseconds($expiresAtMs).LocalDateTime) }
+        else { Write-WidgetLog 'Renewed the Claude Code login but did not save it (the credentials file changed or was locked).' }
         $Cache.renewBlockedUntil = 0; Write-ClaudeCache $Cache
         @{ State = 'renewed'; Token = $access }
     }
@@ -897,6 +897,12 @@ $DataLayer = {
         , $list
     }
 
+    # Labels come from the APIs: keep the CSV valid (no quotes, commas or line breaks)
+    # and inert in spreadsheet apps (no leading = + - @ or tab, however many).
+    function ConvertTo-CsvLabel([string]$Label) {
+        ($Label -replace '[",\r\n]', ' ') -replace '^[=+\-@\t]+', ''
+    }
+
     function Add-UsageSample($History, $Last, $Result) {
         if (-not $Result -or -not $Result.UpdatedAt) { return }
         $path = Get-DataFile 'history.csv'
@@ -914,8 +920,7 @@ $DataLayer = {
             $Last[$key] = $s
             try {
                 if (-not (Test-Path $path)) { [IO.File]::WriteAllText($path, "timestamp_utc,tool,window,used_percent,resets_at_utc`n") }
-                # Labels come from the APIs: keep the CSV valid and inert in spreadsheet apps.
-                $label = ($s.Label -replace '[",\r\n]', ' ') -replace '^[=+\-@]', ''
+                $label = ConvertTo-CsvLabel $s.Label
                 $row = '{0},"{1}","{2}",{3},{4}' -f $s.At.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv), $s.Tool, $label,
                     $s.Percent.ToString('0.##', $inv), $w.ResetsAt.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv)
                 [IO.File]::AppendAllText($path, $row + "`n", [Text.UTF8Encoding]::new($false))
@@ -925,7 +930,7 @@ $DataLayer = {
 
     # Burn rate from the last hour (5-hour window) or day (weekly window); falls
     # back to the average since the window started when there is too little history.
-    function Get-WindowForecast($History, [string]$Tool, $w, [DateTimeOffset]$UpdatedAt) {
+    function Get-WindowForecast($History, [string]$Tool, $w, [Nullable[DateTimeOffset]]$UpdatedAt) {
         $now = [DateTimeOffset]::UtcNow
         if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { return $null }
         $reset = $w.ResetsAt.ToUnixTimeSeconds()
@@ -1008,11 +1013,11 @@ $DataLayer = {
                     if ($v) { $c.latest = $v }
                 } else {
                     $c.checkedAt = $now - 86400 + 3600   # try again in an hour
-                    Write-Log "Update check: HTTP $status"
+                    Write-WidgetLog "Update check: HTTP $status"
                 }
             } catch {
                 $c.checkedAt = $now - 86400 + 3600
-                Write-Log ('Update check: ' + $_.Exception.GetBaseException().Message)
+                Write-WidgetLog ('Update check: ' + $_.Exception.GetBaseException().Message)
             } finally { $client.Dispose() }
             try { ([pscustomobject]$c) | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8 } catch { }
         }
@@ -1278,7 +1283,7 @@ $sync.Codex = New-UsageResult 'Codex'; $sync.Codex.Loading = $true
 
 $WorkerLoop = {
     $ErrorActionPreference = 'Stop'
-    $AppVersion = $sync.AppVersion
+    Set-Variable -Name AppVersion -Value $sync.AppVersion -Scope Script   # read by the data layer
     $claudeNext = 0; $codexNext = 0; $derivedNext = 0; $updateNext = 0
     $tokClaude = New-TokenState; $tokCodex = New-TokenState
     $history = Import-UsageHistory; $last = @{}
@@ -1292,8 +1297,8 @@ $WorkerLoop = {
                 $u = Update-Claude $sync.ClaudeInterval $manual ([bool]$sync.AutoRenew)
                 $sync.Claude = $u.Result; $claudeNext = $u.NextAt
                 Add-UsageSample $history $last $u.Result
-                if ($u.Result.Error) { Write-Log ('Claude: {0} - {1}' -f $u.Result.Error, $u.Result.Detail) }
-            } catch { Write-Log "Claude worker: $_"; $claudeNext = $now + 120 }
+                if ($u.Result.Error) { Write-WidgetLog ('Claude: {0} - {1}' -f $u.Result.Error, $u.Result.Detail) }
+            } catch { Write-WidgetLog "Claude worker: $_"; $claudeNext = $now + 120 }
             $derivedNext = 0; $sync.Version++
         }
         if ($now -ge $codexNext) {
@@ -1306,8 +1311,8 @@ $WorkerLoop = {
                     $sync.Codex = $u.Result; $codexNext = $u.NextAt
                     Add-UsageSample $history $last $u.Result
                 }
-                if ($u.Result.Detail) { Write-Log ('Codex: {0}' -f $u.Result.Detail) }
-            } catch { Write-Log "Codex worker: $_"; $codexNext = $now + 120 }
+                if ($u.Result.Detail) { Write-WidgetLog ('Codex: {0}' -f $u.Result.Detail) }
+            } catch { Write-WidgetLog "Codex worker: $_"; $codexNext = $now + 120 }
             $derivedNext = 0; $sync.Version++
         }
         if ($now -ge $derivedNext) {
@@ -1321,13 +1326,13 @@ $WorkerLoop = {
                     $keep = @($history | Where-Object { $_.At -ge $cut }); $history.Clear(); foreach ($s in $keep) { $null = $history.Add($s) }
                 }
                 $sync.Forecast = @{ 'Claude Code' = (Get-Forecasts $history $sync.Claude); 'Codex' = (Get-Forecasts $history $sync.Codex) }
-            } catch { Write-Log "Derived values: $_" }
+            } catch { Write-WidgetLog "Derived values: $_" }
             $derivedNext = $now + 60
             $sync.Version++
         }
         if ($sync.CheckUpdates -and $now -ge $updateNext) {
             # Get-AvailableUpdate itself asks GitHub at most once a day.
-            try { $sync.Update = Get-AvailableUpdate $sync.AppVersion; $sync.Version++ } catch { Write-Log "Update check: $_" }
+            try { $sync.Update = Get-AvailableUpdate $sync.AppVersion; $sync.Version++ } catch { Write-WidgetLog "Update check: $_" }
             $updateNext = $now + 3600
         }
         Start-Sleep -Milliseconds 500
@@ -1455,7 +1460,7 @@ function Open-ReleasePage {
     $u = $sync.Update
     $url = 'https://github.com/mondrikrob/quota-burndown/releases'
     if ($u -and $u.Version -match '^\d{1,4}\.\d{1,4}\.\d{1,6}$') { $url += '/tag/v' + $u.Version }
-    try { Start-Process $url } catch { Write-Log "Open release page: $_" }
+    try { Start-Process $url } catch { Write-WidgetLog "Open release page: $_" }
 }
 
 function Update-UpdateLink {
@@ -1837,7 +1842,7 @@ $strip.Add_MouseLeftButtonUp({
 # The tray icon is just the app logo; the numbers live in its tooltip.
 $tray = [Windows.Forms.NotifyIcon]::new()
 $IconPath = Join-Path $DataDir 'quota-burndown.ico'
-try { Save-LogoIcon $IconPath } catch { Write-Log "Logo: $_" }
+try { Save-LogoIcon $IconPath } catch { Write-WidgetLog "Logo: $_" }
 if (Test-Path $IconPath) { $tray.Icon = [Drawing.Icon]::new($IconPath, [Windows.Forms.SystemInformation]::SmallIconSize) }
 
 function Update-Tray {
@@ -1938,7 +1943,7 @@ $miRefresh.Add_Click({ Request-Refresh })
 $miTop.Add_Click({ $window.Topmost = -not $window.Topmost; $Settings.Topmost = $window.Topmost; Save-Settings $Settings })
 $miStrip.Add_Click({ $Settings.StripVisible = -not $Settings.StripVisible; Save-Settings $Settings; Update-StripPlacement })
 $miStripReset.Add_Click({ $Settings.StripOffset = 8; Save-Settings $Settings; Update-StripPlacement })
-$miStart.Add_Click({ try { Set-Autostart (-not (Test-Path $StartupLink)) } catch { Write-Log "Autostart: $_" } })
+$miStart.Add_Click({ try { Set-Autostart (-not (Test-Path $StartupLink)) } catch { Write-WidgetLog "Autostart: $_" } })
 $miData.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $DataDir) })
 $miExit.Add_Click({ Exit-Widget })
 
@@ -1993,17 +1998,17 @@ $timer.Add_Tick({
                 $script:shownVersion = $v
                 Update-View
             }
-        } catch { Write-Log "Render: $_" }
+        } catch { Write-WidgetLog "Render: $_" }
     })
 
 # A faster loop just for keeping the strip glued to (and above) the taskbar.
 $stripTimer = [Windows.Threading.DispatcherTimer]::new()
 $stripTimer.Interval = [TimeSpan]::FromMilliseconds(500)
-$stripTimer.Add_Tick({ try { if (-not $script:stripDrag) { Update-StripPlacement } } catch { Write-Log "Strip: $_" } })
+$stripTimer.Add_Tick({ try { if (-not $script:stripDrag) { Update-StripPlacement } } catch { Write-WidgetLog "Strip: $_" } })
 
 $app = [Windows.Application]::new()
 $app.ShutdownMode = 'OnExplicitShutdown'
-$app.Add_DispatcherUnhandledException({ param($s, $e) Write-Log ('UI: ' + $e.Exception.Message); $e.Handled = $true })
+$app.Add_DispatcherUnhandledException({ param($s, $e) Write-WidgetLog ('UI: ' + $e.Exception.Message); $e.Handled = $true })
 
 function Save-ElementPng($Element, [string]$Path) {
     $Element.Measure([Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
@@ -2041,5 +2046,5 @@ $timer.Start()
 $stripTimer.Start()
 if ($Settings.Visible) { $window.Show() }
 Update-StripPlacement
-Write-Log "Started $AppVersion"
+Write-WidgetLog "Started $AppVersion"
 $null = $app.Run()

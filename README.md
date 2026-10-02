@@ -53,7 +53,33 @@ Either one alone is fine; the other section just shows "not found".
 
 ## Install
 
-1. Download `QuotaBurndown.ps1` (or clone this repository) and read it. It's one file, and it's meant to be readable.
+Pick one. All three end with the same result: the script in `%USERPROFILE%\.quota-burndown`, **Quota Burndown** in the Start menu, and the widget running.
+
+### Option 1: zip with a double-click installer
+
+1. From the [latest release](https://github.com/mondrikrob/quota-burndown/releases/latest), download `QuotaBurndown-<version>.zip`.
+2. Optional, but a good habit: [check its SHA-256](#verify-the-download).
+3. Extract the zip, then double-click **`Install.cmd`**. Windows may warn that the file came from the internet; choose **Run**. The installer:
+   - runs `Unblock-File` on the `QuotaBurndown.ps1` next to it,
+   - then runs `QuotaBurndown.ps1 -Install`.
+
+   That's all it does; open it in Notepad to check.
+
+### Option 2: Scoop
+
+If you use [Scoop](https://scoop.sh), this repository is also a Scoop bucket. The manifest pins the release URL and its SHA-256, so Scoop refuses a file that doesn't match.
+
+```powershell
+scoop bucket add quota-burndown https://github.com/mondrikrob/quota-burndown
+scoop install quota-burndown/quota-burndown
+QuotaBurndown -Install
+```
+
+To update, run `scoop update quota-burndown`, then `QuotaBurndown -Install` again.
+
+### Option 3: just the script
+
+1. Download `QuotaBurndown.ps1` from the [latest release](https://github.com/mondrikrob/quota-burndown/releases/latest) (or clone this repository) and read it. It's one file, and it's meant to be readable.
 2. Unblock it (files downloaded from the internet are marked), then install:
 
    ```powershell
@@ -61,14 +87,29 @@ Either one alone is fine; the other section just shows "not found".
    powershell -NoProfile -ExecutionPolicy Bypass -File .\QuotaBurndown.ps1 -Install
    ```
 
-   This copies the script to `%USERPROFILE%\.quota-burndown`, adds **Quota Burndown** to the Start menu and starts it. Run the same command again after updating the script.
+   Run the same command again after updating the script.
 
-   The first install asks two yes/no questions (both default to **no**, and both can be changed later in the menu):
-   - **Renew the Claude Code login automatically?** See [Claude login renewal](#claude-login-renewal) below.
-   - **Check for new versions once a day?** The widget then asks GitHub for the latest version number and shows a link if there's a newer one. Nothing is downloaded or installed automatically.
-3. Optional: right-click the widget and choose **Start with Windows**.
+### After installing
+
+The first install asks two yes/no questions (both default to **no**, and both can be changed later in the menu):
+- **Renew the Claude Code login automatically?** See [Claude login renewal](#claude-login-renewal) below.
+- **Check for new versions once a day?** The widget then asks GitHub for the latest version number and shows a link if there's a newer one. Nothing is downloaded or installed automatically.
+
+Optional: right-click the widget and choose **Start with Windows**.
 
 `-ExecutionPolicy Bypass` only applies to that one PowerShell process; it doesn't change your system policy. The Start menu shortcut launches the script through `conhost --headless`, so no console window appears.
+
+There are deliberately no `irm ... | iex` one-liners: you always get a file you can read and check before running it. The script isn't code-signed (a certificate costs money); the SHA-256 checksums are the way to make sure you got the published file.
+
+### Verify the download
+
+Each release lists the SHA-256 of every file in its notes and in `SHA256SUMS.txt`. Compare them with:
+
+```powershell
+Get-FileHash .\QuotaBurndown-1.3.1.zip -Algorithm SHA256
+```
+
+The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn't matter).
 
 ## Using it
 
@@ -178,7 +219,29 @@ See [SECURITY.md](SECURITY.md). In short:
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.quota-burndown\QuotaBurndown.ps1" -Uninstall
 ```
 
+If you installed with Scoop, also run `scoop uninstall quota-burndown`.
+
 This removes the shortcuts and the installed copy. Delete `%USERPROFILE%\.quota-burndown` to remove settings and history too.
+
+## Tested on
+
+| | |
+|---|---|
+| Windows | Windows 11 (ARM64) |
+| PowerShell | Windows PowerShell 5.1 for the widget; the automated tests also run on PowerShell 7 |
+| Taskbar | at the bottom, dark theme, single monitor |
+
+Not tested yet: Windows 10, x64 PCs for the widget itself (the automated tests run on x64), a taskbar on a second monitor, a light taskbar on a real screen (only in rendered previews), and top or side taskbars (the strip hides itself when the taskbar is vertical). Reports are welcome.
+
+## Development
+
+`tests\` holds [Pester](https://pester.dev) 5 tests for the parts that matter most for safety and correctness: the credentials-file update, settings validation, the `history.csv` sanitiser and the forecast levels. GitHub Actions runs them on every push, on Windows PowerShell 5.1 and PowerShell 7, together with a parse check and [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) (`PSScriptAnalyzerSettings.psd1` lists the excluded style rules and why).
+
+```powershell
+Invoke-Pester -Path .\tests
+```
+
+Releases are built with `tools\Build-Release.ps1 -Version x.y.z` (PowerShell 7). It creates the zip and `SHA256SUMS.txt` in `dist\` and pins the new hash in the Scoop manifest (`bucket\quota-burndown.json`).
 
 ## License
 

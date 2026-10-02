@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint and test (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 and PowerShell 7
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse check
+        run: |
+          $errors = $null
+          $null = [Management.Automation.Language.Parser]::ParseFile("$PWD\QuotaBurndown.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Output "::error file=QuotaBurndown.ps1,line=$($_.Extent.StartLineNumber)::$($_.Message)" }; exit 1 }
+          "Parsed OK on PowerShell $($PSVersionTable.PSVersion)"
+
+      - name: ASCII only
+        run: |
+          $bad = @([IO.File]::ReadAllBytes("$PWD\QuotaBurndown.ps1") | Where-Object { $_ -gt 127 }).Count
+          if ($bad) { Write-Output "::error file=QuotaBurndown.ps1::$bad non-ASCII bytes (write them as [char]0x....)"; exit 1 }
+
+      - name: Install test modules
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Core') { $null = Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: PSScriptAnalyzer
+        run: |
+          $found = Invoke-ScriptAnalyzer -Path QuotaBurndown.ps1 -Settings PSScriptAnalyzerSettings.psd1
+          $found | ForEach-Object { Write-Output "::warning file=QuotaBurndown.ps1,line=$($_.Line)::$($_.RuleName): $($_.Message)" }
+          if ($found | Where-Object Severity -in 'Error', 'Warning') { exit 1 }
+
+      - name: Pester
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg

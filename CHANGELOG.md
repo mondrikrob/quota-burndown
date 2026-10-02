@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1 (2026-10-03)
+
+- **Easier, verifiable install.** Each release now has a zip with a double-click `Install.cmd` (it unblocks the script next to it and runs `-Install`, nothing else), a `SHA256SUMS.txt`, and the checksums in the release notes. The repository is also a **Scoop bucket** with a pinned hash: `scoop bucket add quota-burndown https://github.com/mondrikrob/quota-burndown`.
+- **Safer `history.csv`.** Labels lose *all* leading formula characters (`=`, `+`, `-`, `@`, tab), not just the first, so a label like `==1+1` can no longer become a spreadsheet formula.
+- **Fix:** forecasts no longer fail for a reading without an update time.
+- **Automated checks.** GitHub Actions runs a parse check, PSScriptAnalyzer and Pester tests on Windows PowerShell 5.1 and PowerShell 7 for every push.
+- The internal log function is now `Write-WidgetLog`, so it can't clash with PowerShell 7's own `Write-Log`.
+
 ## 1.3.0 (2026-10-03)
 
 - **Automatic Claude login renewal is now opt-in** (off by default). The first `-Install` asks you once, with a plain explanation: renewing presents the widget to Anthropic's login server as Claude Code, which is unofficial. You can switch it later in the menu (**Renew Claude login automatically**). When it's off and the login has expired, the widget says "login expired" and asks you to run `claude` once.
