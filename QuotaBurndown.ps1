@@ -13,9 +13,12 @@
                    The endpoint is undocumented and rate-limits hard (a 429 can carry a
                    ~1 hour Retry-After), so responses are cached on disk and fetched at
                    most every ClaudeRefreshMinutes. The Claude desktop app never renews
-                   that file, so an expired token is renewed here the way the claude CLI
-                   does it, and the new tokens are written back to the same file
-                   (see SECURITY.md). Tokens are never sent to any other host.
+                   that file; if you opt in (ClaudeAutoRenewLogin), an expired token is
+                   renewed here the way the claude CLI does it, and the new tokens are
+                   written back to the same file (see SECURITY.md). Tokens are never
+                   sent to any other host.
+      Updates      Opt-in (CheckForUpdates): once a day the latest release number from
+                   api.github.com. Nothing is downloaded.
       Codex        `codex app-server --stdio`, JSON-RPC method account/rateLimits/read,
                    falling back to the rate_limits blocks in ~/.codex/sessions/**/*.jsonl.
       Tokens       Parsed locally from ~/.claude/projects/**/*.jsonl and
@@ -53,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.2.0'
+$AppVersion = '1.3.0'
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -82,6 +85,8 @@ $DefaultSettings = [ordered]@{
     CodexRefreshMinutes   = 3
     ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
     CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
+    ClaudeAutoRenewLogin  = $null   # renew an expired Claude Code login itself; $null = not asked yet (off)
+    CheckForUpdates       = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
 }
 
 function ConvertTo-Number($Value, $Default, [double]$Min = [double]::MinValue, [double]$Max = [double]::MaxValue) {
@@ -102,6 +107,7 @@ function Read-Settings {
     }
     # The file is hand-editable: never trust its types or ranges.
     foreach ($k in 'Topmost', 'Visible', 'StripVisible') { if ($s[$k] -isnot [bool]) { $s[$k] = $DefaultSettings[$k] } }
+    foreach ($k in 'ClaudeAutoRenewLogin', 'CheckForUpdates') { if ($s[$k] -isnot [bool]) { $s[$k] = $null } }   # opt-in: anything else means "not asked"
     $s.Left = ConvertTo-Number $s.Left $null -100000 100000
     $s.Top = ConvertTo-Number $s.Top $null -100000 100000
     $s.StripOffset = ConvertTo-Number $s.StripOffset 8 -10000 10000
@@ -218,12 +224,57 @@ $DataLayer = {
     # ----- Claude Code login renewal ------------------------------------------
     # The Claude desktop app keeps its own login and never updates
     # ~/.claude/.credentials.json; only the `claude` CLI renews it, and only when
-    # it runs. So when that access token has expired, the widget renews it the
+    # it runs. So when that access token has expired and the user opted in
+    # (ClaudeAutoRenewLogin), the widget renews it the
     # way the CLI does and writes the rotated tokens back into the same file, so
     # the CLI keeps working with them. Refresh tokens are single-use: a refresh
     # token the server rejects is never retried.
 
     $ClaudeOAuthClientId = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'   # Claude Code's public OAuth client
+
+    # Runs a program without a shell or window, with stdin closed (so it can never
+    # wait for an answer), a timeout and capped output. Returns @{ ExitCode; Output }.
+    function Invoke-QuietProcess([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 15) {
+        $psi = [Diagnostics.ProcessStartInfo]::new($Exe, $Arguments)
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        try {
+            $p.StandardInput.Close()
+            $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit($TimeoutSec * 1000)) { throw "$([IO.Path]::GetFileName($Exe)) timed out" }
+            $text = if ($out.Wait(2000)) { $out.Result } else { '' }
+            @{ ExitCode = $p.ExitCode; Output = $(if ($text.Length -gt 65536) { $text.Substring(0, 65536) } else { $text }) }
+        } finally {
+            if (-not $p.HasExited) { try { $p.Kill($true) } catch { try { $p.Kill() } catch { } } }
+            $p.Dispose()
+        }
+    }
+
+    function Find-ClaudeExe {
+        $cmd = Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { return $cmd.Source }
+        $native = Join-Path $HOME '.local\bin\claude.exe'   # the native installer's default location
+        if (Test-Path $native) { return $native }
+        $null
+    }
+
+    # The installed Claude Code version ("2.1.287"), read from `claude --version` and
+    # remembered for a few hours. The token endpoint only accepts Claude Code's own
+    # client name, and a hard-coded version would go stale.
+    function Get-ClaudeCliVersion {
+        if ($script:ClaudeCliVersion -and ([DateTime]::UtcNow - $script:ClaudeCliVersionAt).TotalHours -lt 6) { return $script:ClaudeCliVersion }
+        $exe = Find-ClaudeExe
+        if (-not $exe) { return $null }
+        try { $res = Invoke-QuietProcess $exe '--version' 15 } catch { return $null }
+        $m = [regex]::Match($res.Output, '\b(\d{1,4}\.\d{1,4}\.\d{1,6})\b')
+        if (-not $m.Success) { return $null }
+        $script:ClaudeCliVersion = $m.Groups[1].Value; $script:ClaudeCliVersionAt = [DateTime]::UtcNow
+        $script:ClaudeCliVersion
+    }
 
     function Get-TokenHash([string]$Value) {
         $sha = [Security.Cryptography.SHA256]::Create()
@@ -280,6 +331,8 @@ $DataLayer = {
         $hash = Get-TokenHash $refresh
         if ($Cache.deadRefresh -eq $hash) { return @{ State = 'invalid' } }   # already rejected: wait for a new login
         if ($Cache.renewBlockedUntil -gt $Now) { return @{ State = 'limited'; RetryAt = $Cache.renewBlockedUntil } }
+        $cliVersion = Get-ClaudeCliVersion
+        if (-not $cliVersion) { return @{ State = 'failed'; Detail = "the 'claude' command was not found, so its version is unknown" } }
 
         $client = [Net.Http.HttpClient]::new()
         $client.Timeout = [TimeSpan]::FromSeconds(15)
@@ -291,7 +344,7 @@ $DataLayer = {
             $null = $req.Headers.TryAddWithoutValidation('anthropic-beta', 'oauth-2025-04-20')
             $null = $req.Headers.TryAddWithoutValidation('Accept', 'application/json')
             # The token endpoint sits behind a bot filter that rejects generic client names.
-            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'claude-code/2.1.286')
+            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'claude-code/' + $cliVersion)
             $res = $client.SendAsync($req).GetAwaiter().GetResult()
             $status = [int]$res.StatusCode
             $text = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -327,7 +380,7 @@ $DataLayer = {
     }
 
     # Returns @{ Result = <usage result>; NextAt = <unix seconds of the next attempt> }
-    function Update-Claude([int]$IntervalMin, [bool]$Manual) {
+    function Update-Claude([int]$IntervalMin, [bool]$Manual, [bool]$AutoRenew) {
         $now = Get-UnixNow
         $interval = [Math]::Max(5, $IntervalMin) * 60
         $r = New-UsageResult 'Claude Code'
@@ -367,7 +420,14 @@ $DataLayer = {
             return @{ Result = $r; NextAt = $now + 60 }
         }
         $accessToken = [string]$oauth.accessToken
-        if ($oauth.expiresAt -and [long]$oauth.expiresAt -lt ($now + 300) * 1000) {
+        $expired = $oauth.expiresAt -and [long]$oauth.expiresAt -lt $now * 1000
+        if ($expired -and -not $AutoRenew) {
+            Use-Cache
+            $r.Error = 'login expired'
+            $r.Detail = "The Claude Code login on this PC has expired. Run 'claude' once in a terminal, or turn on 'Renew Claude login automatically' in the menu."
+            return @{ Result = $r; NextAt = $now + 60 }
+        }
+        if ($AutoRenew -and $oauth.expiresAt -and [long]$oauth.expiresAt -lt ($now + 300) * 1000) {
             $renewal = Invoke-ClaudeTokenRenewal $credPath $cache $now
             switch ($renewal.State) {
                 'renewed' { $accessToken = $renewal.Token }
@@ -399,7 +459,7 @@ $DataLayer = {
             $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.anthropic.com/api/oauth/usage')
             $req.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $accessToken)
             $null = $req.Headers.TryAddWithoutValidation('anthropic-beta', 'oauth-2025-04-20')
-            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'quota-burndown/1.2')
+            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'quota-burndown/' + $AppVersion)
             $res = $client.SendAsync($req).GetAwaiter().GetResult()
             $status = [int]$res.StatusCode
             $body = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -489,7 +549,7 @@ $DataLayer = {
             $null = $p.StandardError.ReadToEndAsync()   # drain so the pipe never blocks
             $p.StandardInput.NewLine = "`n"
             $p.StandardInput.AutoFlush = $true
-            $p.StandardInput.WriteLine('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"quota-burndown","version":"1.2"}}}')
+            $p.StandardInput.WriteLine('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"quota-burndown","version":"' + $AppVersion + '"}}}')
             $deadline = [DateTime]::UtcNow.AddSeconds(20)
             $received = 0
             while ($true) {
@@ -915,6 +975,52 @@ $DataLayer = {
         $out
     }
 
+    # ----- update check (opt-in) --------------------------------------------
+    # Only reads the latest release's version number. Nothing is downloaded or run;
+    # the widget just offers a link to the release page.
+
+    function ConvertTo-ReleaseVersion([string]$Tag) {
+        $m = [regex]::Match([string]$Tag, '^v?(\d{1,4}\.\d{1,4}\.\d{1,6})$')
+        if ($m.Success) { $m.Groups[1].Value } else { $null }
+    }
+
+    # Returns @{ Version = '1.3.1' } when a newer release exists, otherwise $null.
+    # Asks GitHub at most once a day; the answer is remembered in update-check.json.
+    function Get-AvailableUpdate([string]$Current) {
+        $path = Get-DataFile 'update-check.json'
+        $now = Get-UnixNow
+        $c = @{ checkedAt = [long]0; latest = '' }
+        try { if (Test-Path $path) { $j = Get-Content $path -Raw | ConvertFrom-Json; $c.checkedAt = [long]$j.checkedAt; $c.latest = [string]$j.latest } } catch { }
+        if ($c.checkedAt -gt $now -or ($now - $c.checkedAt) -ge 86400) {
+            $client = [Net.Http.HttpClient]::new()
+            $client.Timeout = [TimeSpan]::FromSeconds(10)
+            $client.MaxResponseContentBufferSize = 512KB
+            try {
+                $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.github.com/repos/mondrikrob/quota-burndown/releases/latest')
+                $null = $req.Headers.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
+                $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'quota-burndown/' + $Current)
+                $res = $client.SendAsync($req).GetAwaiter().GetResult()
+                $status = [int]$res.StatusCode
+                $text = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                $c.checkedAt = $now
+                if ($status -eq 200) {
+                    $v = ConvertTo-ReleaseVersion ($text | ConvertFrom-Json).tag_name
+                    if ($v) { $c.latest = $v }
+                } else {
+                    $c.checkedAt = $now - 86400 + 3600   # try again in an hour
+                    Write-Log "Update check: HTTP $status"
+                }
+            } catch {
+                $c.checkedAt = $now - 86400 + 3600
+                Write-Log ('Update check: ' + $_.Exception.GetBaseException().Message)
+            } finally { $client.Dispose() }
+            try { ([pscustomobject]$c) | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8 } catch { }
+        }
+        $cur = ConvertTo-ReleaseVersion $Current
+        if ($c.latest -and $cur -and ([version]$c.latest -gt [version]$cur)) { return @{ Version = $c.latest } }
+        $null
+    }
+
     # ----- formatting -------------------------------------------------------
 
     function Format-Tokens([double]$n) {
@@ -1015,7 +1121,7 @@ function Save-LogoIcon([string]$Path) {
 if ($Once) {
     $history = Import-UsageHistory
     foreach ($kind in 'claude', 'codex') {
-        $r = if ($kind -eq 'claude') { (Update-Claude $Settings.ClaudeRefreshMinutes $false).Result } else { (Update-Codex $Settings.CodexRefreshMinutes).Result }
+        $r = if ($kind -eq 'claude') { (Update-Claude $Settings.ClaudeRefreshMinutes $false ([bool]$Settings.ClaudeAutoRenewLogin)).Result } else { (Update-Codex $Settings.CodexRefreshMinutes).Result }
         $st = New-TokenState
         if ($kind -eq 'claude') { Update-ClaudeTokens $st } else { Update-CodexTokens $st }
         $tokens = Get-WindowTokens $r $st $kind
@@ -1072,14 +1178,59 @@ function Stop-RunningWidget {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 }
 
+# Asks a yes/no question at install time. Returns $null when nobody can answer
+# (no console input), so the question is asked again at the next interactive install.
+function Read-YesNo([string]$Text) {
+    try { if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) { return $null } } catch { return $null }
+    Write-Host ''
+    Write-Host $Text
+    while ($true) {
+        try { $a = Read-Host '  Your choice [y/N]' } catch { return $null }
+        if ($a -match '^\s*(y|yes)\s*$') { return $true }
+        if ($a -match '^\s*(n|no)?\s*$') { return $false }
+    }
+}
+
+function Request-InstallChoices {
+    $changed = $false
+    if ($null -eq $Settings.ClaudeAutoRenewLogin) {
+        $Settings.ClaudeAutoRenewLogin = Read-YesNo @'
+Renew the Claude Code login automatically?
+  Claude Code's login on this PC lasts about 8 hours. The Claude desktop app does
+  not renew it; only the 'claude' command does, when you run it. Quota Burndown can
+  renew it for you by talking to Anthropic's login server the way Claude Code does
+  (it presents itself as Claude Code). This is not an official Anthropic feature: it
+  may stop working, and Anthropic could consider it against their terms of service.
+  If you answer no, the widget shows "login expired" and you run 'claude' once.
+'@
+        $changed = $changed -or ($null -ne $Settings.ClaudeAutoRenewLogin)
+    }
+    if ($null -eq $Settings.CheckForUpdates) {
+        $Settings.CheckForUpdates = Read-YesNo @'
+Check for new versions once a day?
+  The widget asks api.github.com for the latest Quota Burndown release number and,
+  if it is newer, shows a link to the release page. Nothing is downloaded or
+  installed automatically, and nothing about you or your usage is sent.
+'@
+        $changed = $changed -or ($null -ne $Settings.CheckForUpdates)
+    }
+    if ($changed) { Save-Settings $Settings }
+}
+
 if ($Install) {
     Stop-RunningWidget
+    $Settings = Read-Settings   # the old widget saved its own settings while exiting
+    Request-InstallChoices
     if ((Resolve-Path $PSCommandPath).Path -ne $InstalledScript) { Copy-Item $PSCommandPath $InstalledScript -Force }
     New-LaunchShortcut $StartMenuLink $InstalledScript
     if (Test-Path $StartupLink) { New-LaunchShortcut $StartupLink $InstalledScript }
     # Launch through Explorer so the widget never inherits another app's sandbox.
     Start-Process explorer.exe -ArgumentList ('"{0}"' -f $StartMenuLink)
     Write-Output "Quota Burndown $AppVersion installed to $InstalledScript and started."
+    $state = { param($v) if ($v -eq $true) { 'on' } elseif ($v -eq $false) { 'off' } else { 'off (not asked: no console)' } }
+    Write-Output ('  Renew Claude login automatically: {0}' -f (& $state $Settings.ClaudeAutoRenewLogin))
+    Write-Output ('  Check for updates daily:          {0}' -f (& $state $Settings.CheckForUpdates))
+    Write-Output '  You can change both later from the widget menu (right-click).'
     return
 }
 
@@ -1120,13 +1271,15 @@ $sync = [hashtable]::Synchronized(@{
         Claude = $null; Codex = $null; Tokens = @{}; Forecast = @{}
         Version = 0; RefreshRequested = $false; Stop = $false
         ClaudeInterval = $Settings.ClaudeRefreshMinutes; CodexInterval = $Settings.CodexRefreshMinutes
+        AutoRenew = [bool]$Settings.ClaudeAutoRenewLogin; CheckUpdates = [bool]$Settings.CheckForUpdates; Update = $null; AppVersion = $AppVersion
     })
 $sync.Claude = New-UsageResult 'Claude Code'; $sync.Claude.Loading = $true
 $sync.Codex = New-UsageResult 'Codex'; $sync.Codex.Loading = $true
 
 $WorkerLoop = {
     $ErrorActionPreference = 'Stop'
-    $claudeNext = 0; $codexNext = 0; $derivedNext = 0
+    $AppVersion = $sync.AppVersion
+    $claudeNext = 0; $codexNext = 0; $derivedNext = 0; $updateNext = 0
     $tokClaude = New-TokenState; $tokCodex = New-TokenState
     $history = Import-UsageHistory; $last = @{}
     foreach ($s in $history) { $last[$s.Tool + '|' + $s.Label] = $s }
@@ -1136,7 +1289,7 @@ $WorkerLoop = {
         $now = Get-UnixNow
         if ($now -ge $claudeNext) {
             try {
-                $u = Update-Claude $sync.ClaudeInterval $manual
+                $u = Update-Claude $sync.ClaudeInterval $manual ([bool]$sync.AutoRenew)
                 $sync.Claude = $u.Result; $claudeNext = $u.NextAt
                 Add-UsageSample $history $last $u.Result
                 if ($u.Result.Error) { Write-Log ('Claude: {0} - {1}' -f $u.Result.Error, $u.Result.Detail) }
@@ -1171,6 +1324,11 @@ $WorkerLoop = {
             } catch { Write-Log "Derived values: $_" }
             $derivedNext = $now + 60
             $sync.Version++
+        }
+        if ($sync.CheckUpdates -and $now -ge $updateNext) {
+            # Get-AvailableUpdate itself asks GitHub at most once a day.
+            try { $sync.Update = Get-AvailableUpdate $sync.AppVersion; $sync.Version++ } catch { Write-Log "Update check: $_" }
+            $updateNext = $now + 3600
         }
         Start-Sleep -Milliseconds 500
     }
@@ -1270,7 +1428,11 @@ function New-IconButton([string]$Glyph, [string]$Tip, [scriptblock]$Action, $Bru
     <StackPanel>
       <DockPanel Margin="0,0,0,4">
         <StackPanel x:Name="TopButtons" DockPanel.Dock="Right" Orientation="Horizontal"/>
-        <TextBlock x:Name="TopTitle" Text="QUOTA BURNDOWN" FontSize="10" VerticalAlignment="Center"/>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock x:Name="TopTitle" Text="QUOTA BURNDOWN" FontSize="10" VerticalAlignment="Center"/>
+          <TextBlock x:Name="UpdateLink" FontSize="10" Margin="8,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                     TextDecorations="Underline" Visibility="Collapsed"/>
+        </StackPanel>
       </DockPanel>
       <StackPanel x:Name="Root" Width="236" Margin="0,0,6,0"/>
     </StackPanel>
@@ -1283,6 +1445,27 @@ $root = $window.FindName('Root')
 $card.Background = $B.Card
 $card.BorderBrush = $B.Border
 $window.FindName('TopTitle').Foreground = $B.Muted
+$updateLink = $window.FindName('UpdateLink')
+$updateLink.Foreground = $B.Ok
+$updateLink.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$updateLink.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Open-ReleasePage })
+
+# The page address is built here from a validated version number, never taken from the response.
+function Open-ReleasePage {
+    $u = $sync.Update
+    $url = 'https://github.com/mondrikrob/quota-burndown/releases'
+    if ($u -and $u.Version -match '^\d{1,4}\.\d{1,4}\.\d{1,6}$') { $url += '/tag/v' + $u.Version }
+    try { Start-Process $url } catch { Write-Log "Open release page: $_" }
+}
+
+function Update-UpdateLink {
+    $u = $sync.Update
+    if ($u -and $Settings.CheckForUpdates) {
+        $updateLink.Text = "v$($u.Version) available"
+        $updateLink.ToolTip = "Quota Burndown $($u.Version) is out (you have $AppVersion). Click to open the release page."
+        $updateLink.Visibility = 'Visible'
+    } else { $updateLink.Visibility = 'Collapsed' }
+}
 $window.Topmost = [bool]$Settings.Topmost
 $BarWidth = 236.0
 
@@ -1707,6 +1890,8 @@ function Exit-Widget {
 }
 
 $menu = [Windows.Forms.ContextMenuStrip]::new()
+$miUpdate = $menu.Items.Add('Update available')
+$miUpdateSep = [Windows.Forms.ToolStripSeparator]::new(); $null = $menu.Items.Add($miUpdateSep)
 $miShow = $menu.Items.Add('Show widget')
 $miRefresh = $menu.Items.Add('Refresh now')
 $null = $menu.Items.Add('-')
@@ -1715,6 +1900,12 @@ $miStrip = [Windows.Forms.ToolStripMenuItem]::new('Show on taskbar')
 $miStripReset = [Windows.Forms.ToolStripMenuItem]::new('Reset taskbar position')
 $miStart = [Windows.Forms.ToolStripMenuItem]::new('Start with Windows')
 foreach ($mi in $miTop, $miStrip, $miStripReset, $miStart) { $null = $menu.Items.Add($mi) }
+$null = $menu.Items.Add('-')
+$miRenew = [Windows.Forms.ToolStripMenuItem]::new('Renew Claude login automatically')
+$miRenew.ToolTipText = "Renews an expired Claude Code login the way Claude Code does. Unofficial; see SECURITY.md."
+$miUpdates = [Windows.Forms.ToolStripMenuItem]::new('Check for updates daily')
+$miUpdates.ToolTipText = 'Asks api.github.com for the latest release number once a day. Nothing is downloaded.'
+foreach ($mi in $miRenew, $miUpdates) { $null = $menu.Items.Add($mi) }
 $miData = $menu.Items.Add('Open data folder')
 $null = $menu.Items.Add('-')
 $miExit = $menu.Items.Add('Exit')
@@ -1725,6 +1916,22 @@ $menu.Add_Opening({
         $miStrip.Checked = [bool]$Settings.StripVisible
         $miStripReset.Enabled = [bool]$Settings.StripVisible
         $miStart.Checked = Test-Path $StartupLink
+        $miRenew.Checked = [bool]$Settings.ClaudeAutoRenewLogin
+        $miUpdates.Checked = [bool]$Settings.CheckForUpdates
+        $u = $sync.Update
+        $hasUpdate = [bool]($u -and $Settings.CheckForUpdates)
+        $miUpdate.Visible = $hasUpdate; $miUpdateSep.Visible = $hasUpdate
+        if ($u) { $miUpdate.Text = "Update available: version $($u.Version)" + $Sym.Ellipsis }
+    })
+$miUpdate.Add_Click({ Open-ReleasePage })
+$miRenew.Add_Click({
+        $Settings.ClaudeAutoRenewLogin = -not [bool]$Settings.ClaudeAutoRenewLogin; Save-Settings $Settings
+        $sync.AutoRenew = $Settings.ClaudeAutoRenewLogin; Request-Refresh
+    })
+$miUpdates.Add_Click({
+        $Settings.CheckForUpdates = -not [bool]$Settings.CheckForUpdates; Save-Settings $Settings
+        $sync.CheckUpdates = $Settings.CheckForUpdates
+        if (-not $Settings.CheckForUpdates) { $sync.Update = $null; $sync.Version++ }
     })
 $miShow.Add_Click({ Show-Widget (-not $window.IsVisible) })
 $miRefresh.Add_Click({ Request-Refresh })
@@ -1770,6 +1977,7 @@ function Update-View {
     $root.Children.Clear()
     Add-ProviderSection $sync.Claude $true
     Add-ProviderSection $sync.Codex $false
+    Update-UpdateLink
     Update-Strip
     Update-Tray
     $script:lastRender = [DateTime]::UtcNow
@@ -1810,7 +2018,7 @@ function Save-ElementPng($Element, [string]$Path) {
 }
 
 if ($Snapshot) {
-    $sync.Claude = (Update-Claude $Settings.ClaudeRefreshMinutes $false).Result
+    $sync.Claude = (Update-Claude $Settings.ClaudeRefreshMinutes $false ([bool]$Settings.ClaudeAutoRenewLogin)).Result
     $sync.Codex = (Update-Codex $Settings.CodexRefreshMinutes).Result
     $tc = New-TokenState; $tx = New-TokenState; Update-ClaudeTokens $tc; Update-CodexTokens $tx
     $sync.Tokens = @{ 'Claude Code' = (Get-WindowTokens $sync.Claude $tc 'claude'); 'Codex' = (Get-WindowTokens $sync.Codex $tx 'codex') }

@@ -62,6 +62,10 @@ Either one alone is fine; the other section just shows "not found".
    ```
 
    This copies the script to `%USERPROFILE%\.quota-burndown`, adds **Quota Burndown** to the Start menu and starts it. Run the same command again after updating the script.
+
+   The first install asks two yes/no questions (both default to **no**, and both can be changed later in the menu):
+   - **Renew the Claude Code login automatically?** See [Claude login renewal](#claude-login-renewal) below.
+   - **Check for new versions once a day?** The widget then asks GitHub for the latest version number and shows a link if there's a newer one. Nothing is downloaded or installed automatically.
 3. Optional: right-click the widget and choose **Start with Windows**.
 
 `-ExecutionPolicy Bypass` only applies to that one PowerShell process; it doesn't change your system policy. The Start menu shortcut launches the script through `conhost --headless`, so no console window appears.
@@ -80,6 +84,9 @@ Either one alone is fine; the other section just shows "not found".
 - Show on taskbar
 - Reset taskbar position
 - Start with Windows
+- Renew Claude login automatically
+- Check for updates daily
+- Update available (only when there is one; opens the release page)
 - Open data folder
 - Exit
 
@@ -104,9 +111,17 @@ Either one alone is fine; the other section just shows "not found".
 Notes:
 
 - **The Claude usage endpoint rate-limits aggressively.** A 429 can lock you out for about an hour, so don't set `ClaudeRefreshMinutes` below 10.
-- **The widget renews an expired Claude login.** The Claude desktop app never updates `~/.claude/.credentials.json`; only the `claude` CLI does, when it runs. So when that token expires, the widget renews it the way the CLI does and writes the new tokens back. It changes only those fields and writes the file atomically. See [SECURITY.md](SECURITY.md).
 - **Token counts only cover what's logged on this PC.** The % limits also include claude.ai chats, Codex in ChatGPT on the web and other devices. So a window can show a % used with few or zero local tokens, and the API value is a lower bound.
 - **API value is an estimate.** It uses list prices and ignores long-context surcharges, batch discounts and so on.
+
+## Claude login renewal
+
+Claude Code's login on your PC (in `~/.claude/.credentials.json`) lasts about 8 hours. The `claude` CLI renews it whenever you run it, but the Claude desktop app never does. So if you mostly use the desktop app, the widget will at some point show **login expired**. You have two options:
+
+- **Run `claude` once** in a terminal (and exit it). This is the default, and it's what the widget asks you to do.
+- **Let the widget renew it.** Answer yes at install, or tick **Renew Claude login automatically** in the menu. The widget then renews the login the way Claude Code does and writes the new tokens back. It changes only those fields and writes the file atomically.
+
+  This is unofficial: the widget presents itself to Anthropic's login server as Claude Code, which may stop working and could be considered against Anthropic's terms. Details in [SECURITY.md](SECURITY.md#automatic-login-renewal-opt-in).
 
 ## Settings
 
@@ -118,6 +133,8 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 | `CodexRefreshMinutes` | `3` | |
 | `ClaudePlanUsdPerMonth` | auto | Overrides the detected plan price (Pro $20, Max 5x $100, Max 20x $200) |
 | `CodexPlanUsdPerMonth` | auto | Overrides the detected plan price (Plus $20, Pro $200) |
+| `ClaudeAutoRenewLogin` | asked at install (off) | Renew an expired Claude Code login; also in the menu |
+| `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
 | `Left`, `Top` | saved automatically | Widget position |
@@ -131,6 +148,7 @@ Everything lives in `%USERPROFILE%\.quota-burndown`. It's kept outside AppData o
 | `QuotaBurndown.ps1` | Installed copy of the script |
 | `settings.json` | Your settings |
 | `claude-usage.json` | Last Claude usage response, so restarts don't re-query the rate-limited endpoint |
+| `update-check.json` | When the update check last ran and the latest version it saw (only if the check is on) |
 | `history.csv` | Every usage reading: `timestamp_utc, tool, window, used_percent, resets_at_utc` |
 | `widget.log` | Errors and warnings (rotated at 512 KB) |
 | `quota-burndown.ico` | The logo, used for the tray icon and shortcuts (regenerated on start) |
@@ -139,14 +157,15 @@ Everything lives in `%USERPROFILE%\.quota-burndown`. It's kept outside AppData o
 
 See [SECURITY.md](SECURITY.md). In short:
 
-- The only network traffic is to `api.anthropic.com`, plus whatever the Codex CLI itself does to fetch your limits.
-- The Claude OAuth tokens are read from Claude Code's own file and sent only to `api.anthropic.com` over HTTPS. When the access token has expired, the widget renews it and writes the new tokens back to that same file. They're never written anywhere else or logged.
+- The only network traffic is to `api.anthropic.com`, plus whatever the Codex CLI itself does to fetch your limits. If you turn on the update check, it also asks `api.github.com` once a day for the latest version number.
+- The Claude OAuth tokens are read from Claude Code's own file and sent only to `api.anthropic.com` over HTTPS. They're never written anywhere else or logged. Only if you turn on automatic login renewal does the widget write renewed tokens back to that same file.
 - There is no telemetry.
 
 ## Troubleshooting
 
+- **"login expired":** the Claude Code login on this PC has expired. Run `claude` once in a terminal, or turn on **Renew Claude login automatically** in the menu.
 - **"sign in needed":** Claude Code's saved login can't be renewed (for example, you signed out, or the refresh token was used elsewhere). Run `claude auth login` in a terminal; the widget picks up the new login within a minute.
-- **"login expired":** renewal was rate-limited. The widget retries on its own; hover over the status for the next attempt time.
+- **"login expired" with a retry time** (automatic renewal on): renewal was rate-limited. The widget retries on its own; hover over the status for the next attempt time.
 - **"rate limited":** the Claude usage endpoint asked to wait. The widget keeps showing the last values and retries after the requested time.
 - **Codex "not found":** install the Codex desktop app, or make sure `codex.exe` is on `PATH`.
 - **Codex shows "from logs":** the live query failed; you're seeing the latest values recorded in your Codex session logs.

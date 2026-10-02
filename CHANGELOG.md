@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 (2026-10-03)
+
+- **Automatic Claude login renewal is now opt-in** (off by default). The first `-Install` asks you once, with a plain explanation: renewing presents the widget to Anthropic's login server as Claude Code, which is unofficial. You can switch it later in the menu (**Renew Claude login automatically**). When it's off and the login has expired, the widget says "login expired" and asks you to run `claude` once.
+- **No more hard-coded Claude Code version.** When renewal is on, the version in its User-Agent comes from your installed `claude --version`.
+- **Optional update check.** Also asked once at install, off by default, and in the menu as **Check for updates daily**. When on, the widget asks GitHub at most once a day for the latest release number and, if it's newer, shows a "vX.Y.Z available" link and a menu item that open the release page. Nothing is downloaded or installed.
+
 ## 1.2.0 (2026-10-02)
 
 - **New name: Quota Burndown** (was "Usage Widget"). The script is now `QuotaBurndown.ps1` and data lives in `%USERPROFILE%\.quota-burndown`.
