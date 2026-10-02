@@ -1,0 +1,20 @@
+name: Feature request
+description: An idea to make Quota Burndown more useful.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation or question you'd like the widget to help with.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: How you imagine it working. Rough is fine.
+  - type: markdown
+    attributes:
+      value: |
+        Good to know: the project stays a single PowerShell script with no dependencies, talks to as few hosts as possible, and never sends usage data anywhere. Ideas that fit those limits are much more likely to land.

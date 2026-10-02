@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.3.1'
+$AppVersion = '1.3.2'
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -2014,7 +2014,9 @@ function Save-ElementPng($Element, [string]$Path) {
     $Element.Measure([Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
     $Element.Arrange([Windows.Rect]::new(0, 0, $Element.DesiredSize.Width, $Element.DesiredSize.Height))
     $Element.UpdateLayout()
-    $rtb = [Windows.Media.Imaging.RenderTargetBitmap]::new([int]($Element.ActualWidth * 2) + 4, [int]($Element.ActualHeight * 2) + 4, 192, 192, [Windows.Media.PixelFormats]::Pbgra32)
+    # DesiredSize includes the element's margin, which is where it is drawn from; sizing
+    # the image by ActualWidth alone cut the margin's worth off the right and bottom.
+    $rtb = [Windows.Media.Imaging.RenderTargetBitmap]::new([int]($Element.DesiredSize.Width * 2) + 4, [int]($Element.DesiredSize.Height * 2) + 4, 192, 192, [Windows.Media.PixelFormats]::Pbgra32)
     $rtb.Render($Element)
     $enc = [Windows.Media.Imaging.PngBitmapEncoder]::new()
     $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($rtb))

@@ -6,6 +6,10 @@
 
 <br clear="left">
 
+[![CI](https://github.com/mondrikrob/quota-burndown/actions/workflows/ci.yml/badge.svg)](https://github.com/mondrikrob/quota-burndown/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/mondrikrob/quota-burndown)](https://github.com/mondrikrob/quota-burndown/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/mondrikrob/quota-burndown)](LICENSE)
+
 A small Windows desktop widget and taskbar strip that show your **Claude Code** and **OpenAI Codex** usage limits for the **5-hour** and **weekly** windows. For each window it also shows:
 
 - your pace,
@@ -21,6 +25,10 @@ It's a single PowerShell script. There's nothing to install and no dependencies:
 </p>
 
 Taskbar strip: <img src="docs/strip-dark.png" height="40" alt="Taskbar strip">
+
+## Why
+
+"You've used 62% of your weekly limit" doesn't tell you much on its own. Is that a lot for Thursday evening? Will you run dry on Saturday, or is there room to start a big refactor now? Quota Burndown answers it the way a burndown chart does: it compares what you've used with where an even pace would put you, and projects your recent burn rate to the reset. It sits on the taskbar, so you see it without opening anything. It also shows how much your subscription is worth to you: what the same tokens would have cost on the pay-as-you-go API.
 
 > **Unofficial.** This project is not affiliated with or endorsed by Anthropic or OpenAI. It reads the same usage data that Claude Code's `/usage` command and the Codex CLI use internally. Those endpoints are undocumented and may change at any time.
 
@@ -42,6 +50,20 @@ Taskbar strip: <img src="docs/strip-dark.png" height="40" alt="Taskbar strip">
 - **Usage history.** Every reading is appended to `history.csv`, ready for Excel or Power BI.
 - **Themes.** Follows the Windows light/dark theme, and the strip follows the taskbar's theme.
 - **Hides itself** when a fullscreen app is in front or the taskbar is auto-hidden.
+
+## Alternatives
+
+Several good tools show the same limits. Pick whichever fits; this one focuses on **pace and forecasting**, on a **Windows taskbar strip**. As described in their READMEs in October 2026:
+
+| Tool | Platform | How it differs from Quota Burndown |
+|---|---|---|
+| [Win-CodexBar](https://github.com/nesszer/Win-CodexBar) | Windows tray (Tauri/Rust) | A Windows port of the macOS CodexBar. Covers far more providers (50+), with usage cards in a tray panel. No even-pace marker or run-out forecast. |
+| [Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | Windows taskbar widget (Rust) | The closest relative: also on the taskbar, and supports more providers and multiple accounts. Shows usage and reset times, but no pace, forecast or token value. |
+| [CC Meter](https://pypi.org/project/ccmeter/) | Command line (Python) | Measures what a % of your limit is worth in dollars and tracks over time whether your cap is shrinking. A terminal tool, not a widget. |
+| [Headroom](https://github.com/patwalls/headroom) | macOS menu bar | Session and weekly %, context fill, session cost and a "runs out at this pace" hint. Mac only, Claude only. |
+| [BurnRate](https://tommcfarlin.com/burnrate-claude-code-usage/) | macOS menu bar | Mirrors Claude Code's `/usage` bars (session, week, Opus, Sonnet). Mac only. Its author has since recommended Claude Code's status line instead. |
+
+What Quota Burndown adds: the **even-pace target** for every window, a **run-out forecast** from your recent burn rate, **tokens burned and their API value compared with your plan's price**, Claude Code and Codex side by side, a **`history.csv`** you can analyse, and a single readable script with no install or dependencies. What it lacks: other providers, multiple accounts, macOS and Linux.
 
 ## Requirements
 
@@ -223,6 +245,32 @@ If you installed with Scoop, also run `scoop uninstall quota-burndown`.
 
 This removes the shortcuts and the installed copy. Delete `%USERPROFILE%\.quota-burndown` to remove settings and history too.
 
+## FAQ
+
+**Does it send my data anywhere?**
+No. It talks only to `api.anthropic.com` for your Claude limits, and to `api.github.com` once a day only if you turn on the update check. Codex numbers come from the Codex CLI on your PC. There is no telemetry. See [SECURITY.md](SECURITY.md).
+
+**Does checking the limits use up my quota?**
+No. Reading the usage numbers doesn't run a model, so it costs no tokens. The Claude usage endpoint is rate-limited, though, which is why the widget asks at most every 15 minutes by default.
+
+**Why does it say "login expired"?**
+Claude Code's login on your PC lasts about 8 hours, and only the `claude` command renews it. Run `claude` once, or turn on automatic renewal; see [Claude login renewal](#claude-login-renewal).
+
+**Why are the token numbers so low compared with the %?**
+The % counts everything on your account: claude.ai chats, the desktop and mobile apps, other PCs. The token numbers count only what Claude Code and Codex logged on this PC.
+
+**Does it work with an API key instead of a subscription?**
+No. With a pay-as-you-go API key there are no 5-hour or weekly limits to show. You need a Claude Pro or Max subscription for Claude Code, or a ChatGPT plan for Codex.
+
+**Why PowerShell?**
+It ships with every Windows PC, so there's nothing to install, and a single script is easy to read before you run it. That matters for a tool that touches your login.
+
+**Can I analyse my usage in Excel or Power BI?**
+Yes. Every reading is appended to `%USERPROFILE%\.quota-burndown\history.csv`: timestamp, tool, window, % used and reset time.
+
+**Does it work on macOS or Linux?**
+No, it uses Windows-only parts (WPF, the taskbar). See [Alternatives](#alternatives) for Mac tools.
+
 ## Tested on
 
 | | |
@@ -241,7 +289,7 @@ Not tested yet: Windows 10, x64 PCs for the widget itself (the automated tests r
 Invoke-Pester -Path .\tests
 ```
 
-Releases are built with `tools\Build-Release.ps1 -Version x.y.z` (PowerShell 7). It creates the zip and `SHA256SUMS.txt` in `dist\` and pins the new hash in the Scoop manifest (`bucket\quota-burndown.json`).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules. Releases are built with `tools\Build-Release.ps1 -Version x.y.z` (PowerShell 7). It creates the zip and `SHA256SUMS.txt` in `dist\` and pins the new hash in the Scoop manifest (`bucket\quota-burndown.json`).
 
 ## License
 

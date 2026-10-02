@@ -1,0 +1,58 @@
+name: Bug report
+description: Something doesn't work or shows wrong numbers.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Never paste tokens or the contents of `.credentials.json`.** The outputs asked for below contain no credentials, but please glance over them before posting.
+        Security problems: please [report them privately](https://github.com/mondrikrob/quota-burndown/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Quota Burndown version
+      description: The first line of `widget.log`, or the release you downloaded.
+      placeholder: 1.3.2
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "Run `winver`, or in PowerShell: `[Environment]::OSVersion.VersionString`. Also mention x64 or ARM64 if you know it."
+      placeholder: Windows 11 24H2 (x64)
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Taskbar and display
+      description: Taskbar position, light or dark theme, number of monitors, display scaling.
+      placeholder: bottom, dark, 2 monitors, 150%
+  - type: textarea
+    id: once
+    attributes:
+      label: Output of -Once
+      description: |
+        Run this in PowerShell and paste the output:
+        `powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.quota-burndown\QuotaBurndown.ps1" -Once`
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: End of widget.log
+      description: |
+        `Get-Content "$env:USERPROFILE\.quota-burndown\widget.log" -Tail 30`
+        The log never contains tokens, but check for anything you'd rather not share (for example folder names).
+      render: text
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Screenshots of the widget or strip help a lot.

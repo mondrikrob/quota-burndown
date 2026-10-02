@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.2 (2026-10-03)
+
+- **Fix:** `-Snapshot` cut the widget's right and bottom edges off. The README screenshots are re-rendered with the whole card.
+- **Docs:** a "Why" section, a fair comparison with similar tools, an FAQ and status badges in the README; a social preview image; bug report and feature request forms; CONTRIBUTING.md.
+
 ## 1.3.1 (2026-10-03)
 
 - **Easier, verifiable install.** Each release now has a zip with a double-click `Install.cmd` (it unblocks the script next to it and runs `-Install`, nothing else), a `SHA256SUMS.txt`, and the checksums in the release notes. The repository is also a **Scoop bucket** with a pinned hash: `scoop bucket add quota-burndown https://github.com/mondrikrob/quota-burndown`.
