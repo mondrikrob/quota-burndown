@@ -1,0 +1,5 @@
+# Local noise
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
