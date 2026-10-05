@@ -13,10 +13,10 @@
                    The endpoint is undocumented and rate-limits hard (a 429 can carry a
                    ~1 hour Retry-After), so responses are cached on disk and fetched at
                    most every ClaudeRefreshMinutes. The Claude desktop app never renews
-                   that file; if you opt in (ClaudeAutoRenewLogin), an expired token is
-                   renewed here the way the claude CLI does it, and the new tokens are
-                   written back to the same file (see SECURITY.md). Tokens are never
-                   sent to any other host.
+                   that file; if you opt in (ClaudeAutoRenewLogin), an expired login is
+                   renewed by running Claude Code's own `claude doctor`. The widget only
+                   reads the file (see SECURITY.md). Tokens are never sent to any other
+                   host.
       Updates      Opt-in (CheckForUpdates): once a day the latest release number from
                    api.github.com. Nothing is downloaded.
       Codex        `codex app-server --stdio`, JSON-RPC method account/rateLimits/read,
@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.4.0'
+$AppVersion = '1.5.0'
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -82,12 +82,13 @@ $DefaultSettings = [ordered]@{
     StripVisible          = $true
     StripOffset           = 8       # gap (DIP) between the taskbar strip and the tray area
     StripAllTaskbars      = $false  # also show the strip on the other monitors' taskbars
-    ClaudeRefreshMinutes  = 15      # the Claude usage endpoint rate-limits hard; keep this >= 10
+    ClaudeRefreshMinutes  = 5       # the Claude usage endpoint rate-limits; a 429 is honoured (Retry-After)
     CodexRefreshMinutes   = 3
     ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
     CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
-    ClaudeAutoRenewLogin  = $null   # renew an expired Claude Code login itself; $null = not asked yet (off)
+    ClaudeAutoRenewLogin  = $null   # run `claude doctor` to renew an expired login; $null = not asked yet (off)
     CheckForUpdates       = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
+    SettingsVersion       = 2       # 2: ClaudeRefreshMinutes default lowered from 15 to 5
 }
 
 function ConvertTo-Number($Value, $Default, [double]$Min = [double]::MinValue, [double]$Max = [double]::MaxValue) {
@@ -104,6 +105,9 @@ function Read-Settings {
         try {
             $saved = Get-Content $SettingsPath -Raw | ConvertFrom-Json
             foreach ($p in $saved.PSObject.Properties) { if ($s.Contains($p.Name)) { $s[$p.Name] = $p.Value } }
+            # Older versions saved every setting, so the old default of 15 minutes is in
+            # everyone's file: move an untouched 15 to the new default once.
+            if ([int](ConvertTo-Number $saved.SettingsVersion 1) -lt 2 -and (ConvertTo-Number $saved.ClaudeRefreshMinutes $null) -eq 15) { $s.ClaudeRefreshMinutes = 5 }
         } catch { }
     }
     # The file is hand-editable: never trust its types or ranges.
@@ -112,7 +116,8 @@ function Read-Settings {
     $s.Left = ConvertTo-Number $s.Left $null -100000 100000
     $s.Top = ConvertTo-Number $s.Top $null -100000 100000
     $s.StripOffset = ConvertTo-Number $s.StripOffset 8 -10000 10000
-    $s.ClaudeRefreshMinutes = [int](ConvertTo-Number $s.ClaudeRefreshMinutes 15 5 1440)
+    $s.ClaudeRefreshMinutes = [int](ConvertTo-Number $s.ClaudeRefreshMinutes 5 5 1440)
+    $s.SettingsVersion = $DefaultSettings.SettingsVersion
     $s.CodexRefreshMinutes = [int](ConvertTo-Number $s.CodexRefreshMinutes 3 1 1440)
     $s.ClaudePlanUsdPerMonth = ConvertTo-Number $s.ClaudePlanUsdPerMonth $null 0 100000
     $s.CodexPlanUsdPerMonth = ConvertTo-Number $s.CodexPlanUsdPerMonth $null 0 100000
@@ -183,13 +188,13 @@ $DataLayer = {
     function Get-ClaudeDir { if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' } }
 
     function Read-ClaudeCache {
-        $c = @{ fetchedAt = [long]0; blockedUntil = [long]0; body = $null; renewBlockedUntil = [long]0; deadRefresh = '' }
+        $c = @{ fetchedAt = [long]0; blockedUntil = [long]0; body = $null; renewTriedAt = [long]0; renewFailures = 0 }
         $path = Get-DataFile 'claude-usage.json'
         if (Test-Path $path) {
             try {
                 $j = Get-Content $path -Raw | ConvertFrom-Json
                 $c.fetchedAt = [long]$j.fetchedAt; $c.blockedUntil = [long]$j.blockedUntil; $c.body = [string]$j.body
-                $c.renewBlockedUntil = [long]$j.renewBlockedUntil; $c.deadRefresh = [string]$j.deadRefresh
+                $c.renewTriedAt = [long]$j.renewTriedAt; $c.renewFailures = [int]$j.renewFailures
             } catch { }
         }
         $c
@@ -224,29 +229,31 @@ $DataLayer = {
 
     # ----- Claude Code login renewal ------------------------------------------
     # The Claude desktop app keeps its own login and never updates
-    # ~/.claude/.credentials.json; only the `claude` CLI renews it, and only when
-    # it runs. So when that access token has expired and the user opted in
-    # (ClaudeAutoRenewLogin), the widget renews it the
-    # way the CLI does and writes the rotated tokens back into the same file, so
-    # the CLI keeps working with them. Refresh tokens are single-use: a refresh
-    # token the server rejects is never retried.
-
-    $ClaudeOAuthClientId = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'   # Claude Code's public OAuth client
+    # ~/.claude/.credentials.json; only the `claude` CLI renews it, when it runs and
+    # talks to Anthropic. `claude doctor`, Claude Code's own health check, does that
+    # without any model request. So when the login has expired and the user opted
+    # in (ClaudeAutoRenewLogin), the widget runs it and reads the renewed login back.
+    # The widget itself never writes the credentials file.
 
     # Runs a program without a shell or window, with stdin closed (so it can never
     # wait for an answer), a timeout and capped output. Returns @{ ExitCode; Output }.
-    function Invoke-QuietProcess([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 15) {
+    function Invoke-QuietProcess([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 15, [string]$WorkingDirectory) {
         $psi = [Diagnostics.ProcessStartInfo]::new($Exe, $Arguments)
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $psi.RedirectStandardInput = $true
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
+        if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
         $p = [Diagnostics.Process]::Start($psi)
         try {
             $p.StandardInput.Close()
             $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()
-            if (-not $p.WaitForExit($TimeoutSec * 1000)) { throw "$([IO.Path]::GetFileName($Exe)) timed out" }
+            # One-second slices against the clock, so time asleep counts (see Get-CodexLive).
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+            while (-not $p.WaitForExit(1000)) {
+                if ([DateTime]::UtcNow -ge $deadline) { throw "$([IO.Path]::GetFileName($Exe)) timed out after $TimeoutSec s" }
+            }
             $text = if ($out.Wait(2000)) { $out.Result } else { '' }
             @{ ExitCode = $p.ExitCode; Output = $(if ($text.Length -gt 65536) { $text.Substring(0, 65536) } else { $text }) }
         } finally {
@@ -263,121 +270,39 @@ $DataLayer = {
         $null
     }
 
-    # The installed Claude Code version ("2.1.287"), read from `claude --version` and
-    # remembered for a few hours. The token endpoint only accepts Claude Code's own
-    # client name, and a hard-coded version would go stale.
-    function Get-ClaudeCliVersion {
-        if ($script:ClaudeCliVersion -and ([DateTime]::UtcNow - $script:ClaudeCliVersionAt).TotalHours -lt 6) { return $script:ClaudeCliVersion }
+    function Get-ClaudeExpiresAt([string]$CredPath) {
+        try { [long]((Get-Content $CredPath -Raw | ConvertFrom-Json).claudeAiOauth.expiresAt) } catch { [long]0 }
+    }
+
+    # Seconds to wait before running `claude doctor` again after it didn't help: 5 minutes
+    # for the first two failures (typically the network not being up yet after the
+    # PC woke), then 30 minutes.
+    function Get-RenewRetryDelay([int]$Failures) { if ($Failures -le 2) { 300 } else { 1800 } }
+
+    # Returns @{ State = 'renewed' | 'waiting' | 'failed' | 'missing'; RetryAt; Detail }
+    function Invoke-ClaudeLoginRenewal([string]$CredPath, $Cache, [long]$Now) {
+        $delay = Get-RenewRetryDelay $Cache.renewFailures
+        if ($Cache.renewTriedAt -le $Now -and $Now - $Cache.renewTriedAt -lt $delay) { return @{ State = 'waiting'; RetryAt = $Cache.renewTriedAt + $delay } }
         $exe = Find-ClaudeExe
-        if (-not $exe) { return $null }
-        try { $res = Invoke-QuietProcess $exe '--version' 15 } catch { return $null }
-        $m = [regex]::Match($res.Output, '\b(\d{1,4}\.\d{1,4}\.\d{1,6})\b')
-        if (-not $m.Success) { return $null }
-        $script:ClaudeCliVersion = $m.Groups[1].Value; $script:ClaudeCliVersionAt = [DateTime]::UtcNow
-        $script:ClaudeCliVersion
-    }
-
-    function Get-TokenHash([string]$Value) {
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try { -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)) | Select-Object -First 8 | ForEach-Object { $_.ToString('x2') }) }
-        finally { $sha.Dispose() }
-    }
-
-    # Start and end index of the object value of "$Key" (string-aware brace matching).
-    function Find-JsonObjectSpan([string]$Json, [string]$Key) {
-        $k = $Json.IndexOf('"' + $Key + '"')
-        if ($k -lt 0) { return $null }
-        $start = $Json.IndexOf('{', $k)
-        if ($start -lt 0) { return $null }
-        $depth = 0; $inString = $false; $escaped = $false
-        for ($i = $start; $i -lt $Json.Length; $i++) {
-            $c = $Json[$i]
-            if ($inString) {
-                if ($escaped) { $escaped = $false } elseif ($c -eq [char]92) { $escaped = $true } elseif ($c -eq [char]34) { $inString = $false }
-                continue
+        if (-not $exe) { return @{ State = 'missing' } }
+        $Cache.renewTriedAt = $Now; Write-ClaudeCache $Cache
+        $detail = $null
+        # Run it in our own folder: `claude doctor` reads the settings files of the folder it runs in.
+        try { $res = Invoke-QuietProcess $exe 'doctor' 60 (Join-Path $HOME '.quota-burndown'); $detail = "'claude doctor' ran (exit code $($res.ExitCode)), but the login is still expired." }
+        catch { $detail = $_.Exception.Message }
+        # Claude Code writes the renewed login while it runs; allow it a few more seconds.
+        # (If it lands later still, Update-Claude sees it at its next check a minute later.)
+        for ($i = 0; $i -lt 15; $i++) {
+            $exp = Get-ClaudeExpiresAt $CredPath
+            if ($exp -gt ($Now + 60) * 1000) {
+                $Cache.renewTriedAt = 0; $Cache.renewFailures = 0; Write-ClaudeCache $Cache
+                Write-WidgetLog ("Renewed the Claude Code login with 'claude doctor' (valid until {0:HH:mm})." -f [DateTimeOffset]::FromUnixTimeMilliseconds($exp).LocalDateTime)
+                return @{ State = 'renewed' }
             }
-            if ($c -eq [char]34) { $inString = $true }
-            elseif ($c -eq [char]123) { $depth++ }
-            elseif ($c -eq [char]125) { $depth--; if ($depth -eq 0) { return , @($start, $i) } }
+            Start-Sleep -Seconds 1
         }
-        $null
-    }
-
-    # Replace only accessToken / refreshToken / expiresAt inside "claudeAiOauth" and
-    # leave every other byte of the file (MCP logins, scopes, ...) untouched.
-    # Returns $false when the file changed meanwhile (someone else renewed it).
-    function Save-ClaudeTokens([string]$Path, [string]$OldRefresh, [string]$Access, [string]$Refresh, [long]$ExpiresAtMs) {
-        $json = [IO.File]::ReadAllText($Path)
-        $span = Find-JsonObjectSpan $json 'claudeAiOauth'
-        if (-not $span) { throw 'claudeAiOauth entry not found' }
-        $obj = $json.Substring($span[0], $span[1] - $span[0] + 1)
-        if ([regex]::Match($obj, '"refreshToken"\s*:\s*"([^"]*)"').Groups[1].Value -ne $OldRefresh) { return $false }
-        $obj = [regex]::Replace($obj, '"accessToken"\s*:\s*"[^"]*"', { param($m) '"accessToken":"' + $Access + '"' })
-        if ($Refresh) { $obj = [regex]::Replace($obj, '"refreshToken"\s*:\s*"[^"]*"', { param($m) '"refreshToken":"' + $Refresh + '"' }) }
-        $obj = [regex]::Replace($obj, '"expiresAt"\s*:\s*\d+', { param($m) '"expiresAt":' + $ExpiresAtMs })
-        $out = $json.Substring(0, $span[0]) + $obj + $json.Substring($span[1] + 1)
-        $tmp = $Path + '.quota-burndown.tmp'
-        [IO.File]::WriteAllText($tmp, $out, [Text.UTF8Encoding]::new($false))
-        try { [IO.File]::Replace($tmp, $Path, [NullString]::Value) }   # atomic swap that keeps the file's permissions
-        catch { [IO.File]::Copy($tmp, $Path, $true); Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-        $true
-    }
-
-    # Returns @{ State = 'renewed' | 'invalid' | 'limited' | 'offline' | 'failed'; Token; RetryAt; Detail }
-    function Invoke-ClaudeTokenRenewal([string]$CredPath, $Cache, [long]$Now) {
-        $oauth = $null
-        try { $oauth = (Get-Content $CredPath -Raw | ConvertFrom-Json).claudeAiOauth } catch { }
-        $refresh = [string]$oauth.refreshToken
-        if (-not $refresh) { return @{ State = 'invalid' } }
-        $hash = Get-TokenHash $refresh
-        if ($Cache.deadRefresh -eq $hash) { return @{ State = 'invalid' } }   # already rejected: wait for a new login
-        if ($Cache.renewBlockedUntil -gt $Now) { return @{ State = 'limited'; RetryAt = $Cache.renewBlockedUntil } }
-        $cliVersion = Get-ClaudeCliVersion
-        if (-not $cliVersion) { return @{ State = 'failed'; Detail = "the 'claude' command was not found, so its version is unknown" } }
-
-        $client = [Net.Http.HttpClient]::new()
-        $client.Timeout = [TimeSpan]::FromSeconds(15)
-        $client.MaxResponseContentBufferSize = 64KB
-        try {
-            $body = '{"grant_type":"refresh_token","refresh_token":' + (ConvertTo-Json $refresh) + ',"client_id":"' + $ClaudeOAuthClientId + '"}'
-            $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, 'https://api.anthropic.com/v1/oauth/token')
-            $req.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
-            $null = $req.Headers.TryAddWithoutValidation('anthropic-beta', 'oauth-2025-04-20')
-            $null = $req.Headers.TryAddWithoutValidation('Accept', 'application/json')
-            # The token endpoint sits behind a bot filter that rejects generic client names.
-            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'claude-code/' + $cliVersion)
-            $res = $client.SendAsync($req).GetAwaiter().GetResult()
-            $status = [int]$res.StatusCode
-            $text = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-        } catch {
-            return @{ State = 'offline'; Detail = $_.Exception.GetBaseException().Message }
-        } finally { $client.Dispose() }
-
-        if ($status -eq 400 -or $status -eq 401 -or $status -eq 403) {
-            $Cache.deadRefresh = $hash; Write-ClaudeCache $Cache
-            return @{ State = 'invalid' }
-        }
-        if ($status -ne 200) {
-            # The endpoint answers most failures with 429 and no Retry-After: back off for an hour.
-            $Cache.renewBlockedUntil = $Now + $(if ($status -eq 429) { 3600 } else { 300 }); Write-ClaudeCache $Cache
-            return @{ State = 'limited'; RetryAt = $Cache.renewBlockedUntil; Detail = "HTTP $status" }
-        }
-        try { $j = $text | ConvertFrom-Json } catch { $j = $null }
-        $safe = '^[A-Za-z0-9._~+/=-]{20,4096}$'   # never write anything else into the credentials file
-        $access = [string]$j.access_token; $newRefresh = [string]$j.refresh_token
-        if ($access -notmatch $safe -or ($newRefresh -and $newRefresh -notmatch $safe)) { return @{ State = 'failed'; Detail = 'unexpected token response' } }
-        $lifetime = [long]28800
-        try { $v = [long]$j.expires_in; if ($v -ge 60 -and $v -le 31536000) { $lifetime = $v } } catch { }
-        $expiresAtMs = ($Now + $lifetime) * 1000
-        $saved = $false
-        for ($try = 0; $try -lt 5 -and -not $saved; $try++) {
-            try { $saved = Save-ClaudeTokens $CredPath $refresh $access $newRefresh $expiresAtMs; break }
-            catch { Start-Sleep -Milliseconds 200 }
-        }
-        if ($saved) { Write-WidgetLog ('Renewed the Claude Code login (valid until {0:HH:mm}).' -f [DateTimeOffset]::FromUnixTimeMilliseconds($expiresAtMs).LocalDateTime) }
-        else { Write-WidgetLog 'Renewed the Claude Code login but did not save it (the credentials file changed or was locked).' }
-        $Cache.renewBlockedUntil = 0; Write-ClaudeCache $Cache
-        @{ State = 'renewed'; Token = $access }
+        $Cache.renewFailures = [int]$Cache.renewFailures + 1; Write-ClaudeCache $Cache
+        @{ State = 'failed'; RetryAt = $Now + (Get-RenewRetryDelay $Cache.renewFailures); Detail = $detail }
     }
 
     # Returns @{ Result = <usage result>; NextAt = <unix seconds of the next attempt> }
@@ -420,38 +345,32 @@ $DataLayer = {
             $r.Detail = "No Claude Code login found in $credPath. Run 'claude' and sign in."
             return @{ Result = $r; NextAt = $now + 60 }
         }
-        $accessToken = [string]$oauth.accessToken
-        $expired = $oauth.expiresAt -and [long]$oauth.expiresAt -lt $now * 1000
-        if ($expired -and -not $AutoRenew) {
+        if ($oauth.expiresAt -and [long]$oauth.expiresAt -lt $now * 1000) {
             Use-Cache
             $r.Error = 'login expired'
-            $r.Detail = "The Claude Code login on this PC has expired. Run 'claude' once in a terminal, or turn on 'Renew Claude login automatically' in the menu."
-            return @{ Result = $r; NextAt = $now + 60 }
-        }
-        if ($AutoRenew -and $oauth.expiresAt -and [long]$oauth.expiresAt -lt ($now + 300) * 1000) {
-            $renewal = Invoke-ClaudeTokenRenewal $credPath $cache $now
-            switch ($renewal.State) {
-                'renewed' { $accessToken = $renewal.Token }
-                'invalid' {
-                    Use-Cache
-                    $r.Error = 'sign in needed'
-                    $r.Detail = "Claude Code's saved login can't be renewed. Run 'claude auth login' in a terminal; the widget picks the new login up within a minute."
-                    return @{ Result = $r; NextAt = $now + 60 }
-                }
-                'limited' {
-                    Use-Cache
-                    $r.Error = 'login expired'
-                    $r.Detail = "Couldn't renew the Claude Code login yet; next try at {0:HH:mm}. If this keeps happening, run 'claude auth login'." -f [DateTimeOffset]::FromUnixTimeSeconds($renewal.RetryAt).LocalDateTime
-                    return @{ Result = $r; NextAt = $renewal.RetryAt + 5 }
-                }
-                default {
-                    Use-Cache
-                    $r.Error = 'offline'
-                    $r.Detail = "Couldn't renew the Claude Code login: $($renewal.Detail)"
-                    return @{ Result = $r; NextAt = $now + 120 }
-                }
+            if (-not $AutoRenew) {
+                $r.Detail = "The Claude Code login on this PC has expired. Run 'claude' once in a terminal, or turn on 'Renew Claude login automatically' in the menu."
+                return @{ Result = $r; NextAt = $now + 60 }
             }
+            $renewal = Invoke-ClaudeLoginRenewal $credPath $cache $now
+            if ($renewal.State -eq 'missing') {
+                $r.Detail = "The Claude Code login on this PC has expired, and the 'claude' command wasn't found to renew it. Run 'claude' once in a terminal."
+                return @{ Result = $r; NextAt = $now + 300 }
+            }
+            if ($renewal.State -ne 'renewed') {
+                $why = if ($renewal.Detail) { ' ' + $renewal.Detail } else { '' }
+                $r.Detail = ("The Claude Code login on this PC has expired and renewing it with 'claude doctor' didn't work yet.{0} Next try at {1:HH:mm}; or run 'claude' in a terminal (it asks you to sign in if needed)." -f
+                    $why, [DateTimeOffset]::FromUnixTimeSeconds($renewal.RetryAt).LocalDateTime)
+                # Look again in a minute: reading the file is free, and the login may be renewed
+                # meanwhile (by you, by Claude Code, or just after the wait above). Running
+                # `claude doctor` again is held back by Invoke-ClaudeLoginRenewal itself.
+                return @{ Result = $r; NextAt = $now + 60 }
+            }
+            $r.Error = $null
+            try { $oauth = (Get-Content $credPath -Raw | ConvertFrom-Json).claudeAiOauth } catch { }
         }
+        if ($cache.renewTriedAt -or $cache.renewFailures) { $cache.renewTriedAt = 0; $cache.renewFailures = 0; Write-ClaudeCache $cache }
+        $accessToken = [string]$oauth.accessToken
 
         $client = [Net.Http.HttpClient]::new()
         $client.Timeout = [TimeSpan]::FromSeconds(15)
@@ -559,9 +478,14 @@ $DataLayer = {
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
             $received = 0
             while ($true) {
-                $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
-                $t = if ($left -gt 0) { $p.StandardOutput.ReadLineAsync() }
-                if ($left -le 0 -or -not $t.Wait($left)) { throw ('Codex app-server timed out after {0:0}s waiting for {1}' -f $sw.Elapsed.TotalSeconds, $step) }
+                # Wait in one-second slices against the clock: a wait's own timeout doesn't
+                # run while the PC sleeps, so a single long wait could last for hours.
+                $t = $p.StandardOutput.ReadLineAsync()
+                while (-not $t.Wait(1000)) {
+                    if ([DateTime]::UtcNow -lt $deadline) { continue }
+                    if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec + 60) { throw ('Codex app-server timed out: the PC slept while waiting for {0}' -f $step) }
+                    throw ('Codex app-server timed out after {0:0}s waiting for {1}' -f $sw.Elapsed.TotalSeconds, $step)
+                }
                 $line = $t.Result
                 if ($null -eq $line) {
                     $code = if ($p.WaitForExit(500)) { $p.ExitCode } else { '?' }
@@ -1206,27 +1130,27 @@ function Stop-RunningWidget {
 
 # Asks a yes/no question at install time. Returns $null when nobody can answer
 # (no console input), so the question is asked again at the next interactive install.
-function Read-YesNo([string]$Text) {
+function Read-YesNo([string]$Text, [bool]$Default = $false) {
     try { if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) { return $null } } catch { return $null }
     Write-Host ''
     Write-Host $Text
     while ($true) {
-        try { $a = Read-Host '  Your choice [y/N]' } catch { return $null }
+        try { $a = Read-Host $(if ($Default) { '  Your choice [Y/n]' } else { '  Your choice [y/N]' }) } catch { return $null }
+        if ($a -match '^\s*$') { return $Default }
         if ($a -match '^\s*(y|yes)\s*$') { return $true }
-        if ($a -match '^\s*(n|no)?\s*$') { return $false }
+        if ($a -match '^\s*(n|no)\s*$') { return $false }
     }
 }
 
 function Request-InstallChoices {
     $changed = $false
     if ($null -eq $Settings.ClaudeAutoRenewLogin) {
-        $Settings.ClaudeAutoRenewLogin = Read-YesNo @'
+        $Settings.ClaudeAutoRenewLogin = Read-YesNo -Default $true -Text @'
 Renew the Claude Code login automatically?
   Claude Code's login on this PC lasts about 8 hours. The Claude desktop app does
-  not renew it; only the 'claude' command does, when you run it. Quota Burndown can
-  renew it for you by talking to Anthropic's login server the way Claude Code does
-  (it presents itself as Claude Code). This is not an official Anthropic feature: it
-  may stop working, and Anthropic could consider it against their terms of service.
+  not renew it; only the 'claude' command does, when you run it. When the login has
+  expired, Quota Burndown can run 'claude doctor' (Claude Code's own health check,
+  which uses no tokens), and Claude Code renews its login itself.
   If you answer no, the widget shows "login expired" and you run 'claude' once.
 '@
         $changed = $changed -or ($null -ne $Settings.ClaudeAutoRenewLogin)
@@ -1305,7 +1229,7 @@ $sync.Codex = New-UsageResult 'Codex'; $sync.Codex.Loading = $true
 $WorkerLoop = {
     $ErrorActionPreference = 'Stop'
     Set-Variable -Name AppVersion -Value $sync.AppVersion -Scope Script   # read by the data layer
-    $claudeNext = 0; $codexNext = 0; $derivedNext = 0; $updateNext = 0
+    $claudeNext = 0; $codexNext = 0; $derivedNext = 0; $updateNext = 0; $lastClaudeLog = $null
     $tokClaude = New-TokenState; $tokCodex = New-TokenState
     $history = Import-UsageHistory; $last = @{}
     foreach ($s in $history) { $last[$s.Tool + '|' + $s.Label] = $s }
@@ -1318,7 +1242,9 @@ $WorkerLoop = {
                 $u = Update-Claude $sync.ClaudeInterval $manual ([bool]$sync.AutoRenew)
                 $sync.Claude = $u.Result; $claudeNext = $u.NextAt
                 Add-UsageSample $history $last $u.Result
-                if ($u.Result.Error) { Write-WidgetLog ('Claude: {0} - {1}' -f $u.Result.Error, $u.Result.Detail) }
+                $msg = if ($u.Result.Error) { 'Claude: {0} - {1}' -f $u.Result.Error, $u.Result.Detail }
+                if ($msg -and $msg -ne $lastClaudeLog) { Write-WidgetLog $msg }
+                $lastClaudeLog = $msg
             } catch { Write-WidgetLog "Claude worker: $_"; $claudeNext = $now + 120 }
             $derivedNext = 0; $sync.Version++
         }
@@ -1982,7 +1908,7 @@ $miStart = [Windows.Forms.ToolStripMenuItem]::new('Start with Windows')
 foreach ($mi in $miTop, $miStrip, $miStripAll, $miStripReset, $miStart) { $null = $menu.Items.Add($mi) }
 $null = $menu.Items.Add('-')
 $miRenew = [Windows.Forms.ToolStripMenuItem]::new('Renew Claude login automatically')
-$miRenew.ToolTipText = "Renews an expired Claude Code login the way Claude Code does. Unofficial; see SECURITY.md."
+$miRenew.ToolTipText = "When the Claude Code login has expired, runs 'claude doctor', which renews it."
 $miUpdates = [Windows.Forms.ToolStripMenuItem]::new('Check for updates daily')
 $miUpdates.ToolTipText = 'Asks api.github.com for the latest release number once a day. Nothing is downloaded.'
 foreach ($mi in $miRenew, $miUpdates) { $null = $menu.Items.Add($mi) }

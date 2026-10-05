@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.0 (2026-10-05)
+
+- **Login renewal is now official.** When the Claude Code login has expired, the widget runs `claude doctor`, Claude Code's own installation check, and Claude Code renews its login itself. It uses no tokens. The widget no longer calls Anthropic's token endpoint as if it were Claude Code, and it never writes `~/.claude/.credentials.json` any more. It only reads it. The unofficial renewal code is gone.
+  - Still opt-in, and asked once at install (now with "yes" as the suggested answer). If you turned it on before, it stays on.
+  - While the login is expired, the widget checks the login file every minute, so a renewal shows up at once, whoever did it. If `claude doctor` didn't help (for example right after the PC woke and the network wasn't up yet), it's run again after 5 minutes, twice, and then every 30 minutes.
+- **Fresher Claude numbers.** Claude usage is now fetched every 5 minutes instead of 15. If your `settings.json` still had the old default of 15, it's moved to 5 once. If you'd rather keep 15, set it again afterwards and it stays. When the endpoint answers "rate limited", the widget still waits as long as it's told.
+- **Fix: Codex queries got stuck across sleep.** A query that was running when the PC went to sleep stayed stuck until long after it woke, because Windows doesn't count sleep time for that kind of timeout. Waits now check the real clock every second, so a stale query is stopped and retried within a second of waking.
+
 ## 1.4.0 (2026-10-03)
 
 - **Strip on every monitor (optional).** New menu item **Show on all taskbars** (setting `StripAllTaskbars`, off by default): the strip also appears on the taskbars of your other monitors, left of their clock area.

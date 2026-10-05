@@ -21,62 +21,87 @@ BeforeAll {
     . ([scriptblock]::Create($defaults.Extent.Text))
 }
 
-Describe 'Find-JsonObjectSpan' {
-    It 'finds the object even with braces and escaped quotes inside strings' {
-        $json = '{"a":{"x":"}{\"}"},"claudeAiOauth":{"t":"{","n":{"m":1}},"z":2}'
-        $span = Find-JsonObjectSpan $json 'claudeAiOauth'
-        $json.Substring($span[0], $span[1] - $span[0] + 1) | Should -Be '{"t":"{","n":{"m":1}}'
-    }
-
-    It 'returns nothing when the key is missing' {
-        Find-JsonObjectSpan '{"other":{}}' 'claudeAiOauth' | Should -BeNullOrEmpty
-    }
-}
-
-Describe 'Save-ClaudeTokens' {
+Describe 'Invoke-ClaudeLoginRenewal' {
     BeforeEach {
-        # Another login (an MCP server) with token fields of its own comes first and must not change.
-        $script:original = @'
-{
-  "mcpOAuth": { "srv|1": { "accessToken": "mcp-access-AAAA", "refreshToken": "mcp-refresh-BBBB", "expiresAt": 111, "note": "}{" } },
-  "claudeAiOauth":   {"accessToken":"old-access-1234567890","refreshToken": "old-refresh-1234567890",
-     "expiresAt": 1700000000000, "scopes": ["user:inference", "user:profile"], "subscriptionType": "pro"}
-}
-'@ -replace "`r`n", "`n"
+        # Stand-ins, defined in the test's scope: nothing real is run or written.
+        $script:runs = @()
+        $script:logged = @()
+        function Find-ClaudeExe { 'claude.exe' }
+        function Write-ClaudeCache($c) { }
+        function Write-WidgetLog([string]$Message) { $script:logged += $Message }
+        function Start-Sleep { }
         $script:cred = Join-Path $TestDrive '.credentials.json'
-        [IO.File]::WriteAllText($cred, $original, [Text.UTF8Encoding]::new($false))
+        $script:now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $script:expired = '{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":' + (($now - 3600) * 1000) + '}}'
+        Set-Content $cred $expired
+        $script:cache = @{ renewTriedAt = [long]0; renewFailures = 0 }
     }
 
-    It 'changes only accessToken, refreshToken and expiresAt of claudeAiOauth' {
-        Save-ClaudeTokens $cred 'old-refresh-1234567890' 'new-access-ABCDEFGHIJ' 'new-refresh-ABCDEFGHIJ' 1800000000000 | Should -BeTrue
-        $expected = $original.Replace('"accessToken":"old-access-1234567890"', '"accessToken":"new-access-ABCDEFGHIJ"').
-            Replace('"refreshToken": "old-refresh-1234567890"', '"refreshToken":"new-refresh-ABCDEFGHIJ"').
-            Replace('"expiresAt": 1700000000000', '"expiresAt":1800000000000')
-        [IO.File]::ReadAllText($cred) | Should -BeExactly $expected
+    It 'runs claude doctor in the widget folder and reports a renewed login' {
+        function Invoke-QuietProcess($Exe, $Arguments, $TimeoutSec, $WorkingDirectory) {
+            $script:runs += "$Exe $Arguments in $WorkingDirectory"
+            # What Claude Code does: write a fresh login.
+            Set-Content $script:cred ('{"claudeAiOauth":{"accessToken":"b","refreshToken":"s","expiresAt":' + (($script:now + 28800) * 1000) + '}}')
+            @{ ExitCode = 0; Output = '' }
+        }
+        (Invoke-ClaudeLoginRenewal $cred $cache $now).State | Should -Be 'renewed'
+        $script:runs | Should -HaveCount 1
+        $script:runs[0] | Should -Be ('claude.exe doctor in ' + (Join-Path $HOME '.quota-burndown'))
+        $cache.renewTriedAt | Should -Be 0
+        $cache.renewFailures | Should -Be 0
+        $script:logged -join ' ' | Should -Match 'Renewed the Claude Code login'
     }
 
-    It 'keeps the refresh token when the server sent no new one' {
-        Save-ClaudeTokens $cred 'old-refresh-1234567890' 'new-access-ABCDEFGHIJ' '' 1800000000000 | Should -BeTrue
-        $o = (Get-Content $cred -Raw | ConvertFrom-Json).claudeAiOauth
-        $o.refreshToken | Should -Be 'old-refresh-1234567890'
-        $o.accessToken | Should -Be 'new-access-ABCDEFGHIJ'
+    It 'reports failure when the login is still expired afterwards' {
+        function Invoke-QuietProcess($Exe, $Arguments, $TimeoutSec, $WorkingDirectory) { $script:runs += 1; @{ ExitCode = 1; Output = '' } }
+        $res = Invoke-ClaudeLoginRenewal $cred $cache $now
+        $res.State | Should -Be 'failed'
+        $res.Detail | Should -Match 'exit code 1'
+        $res.RetryAt | Should -Be ($now + 300)   # first failure: try again in 5 minutes
+        $cache.renewFailures | Should -Be 1
     }
 
-    It 'refuses to write when the refresh token changed meanwhile' {
-        Save-ClaudeTokens $cred 'someone-else-renewed-it' 'new-access-ABCDEFGHIJ' 'new-refresh-ABCDEFGHIJ' 1800000000000 | Should -BeFalse
-        [IO.File]::ReadAllText($cred) | Should -BeExactly $original
+    It 'retries after 5 minutes twice, then every 30 minutes' {
+        function Invoke-QuietProcess($Exe, $Arguments, $TimeoutSec, $WorkingDirectory) { $script:runs += 1; @{ ExitCode = 0; Output = '' } }
+        $cache.renewFailures = 1; $cache.renewTriedAt = $now - 120
+        $res = Invoke-ClaudeLoginRenewal $cred $cache $now
+        $res.State | Should -Be 'waiting'
+        $res.RetryAt | Should -Be ($now - 120 + 300)
+        $script:runs | Should -HaveCount 0
+
+        $cache.renewTriedAt = $now - 301
+        $res = Invoke-ClaudeLoginRenewal $cred $cache $now
+        $res.State | Should -Be 'failed'
+        $cache.renewFailures | Should -Be 2
+        $res.RetryAt | Should -Be ($now + 300)
+
+        $cache.renewTriedAt = $now - 301
+        $res = Invoke-ClaudeLoginRenewal $cred $cache $now
+        $cache.renewFailures | Should -Be 3
+        $res.RetryAt | Should -Be ($now + 1800)
+        $script:runs | Should -HaveCount 2
+
+        $cache.renewTriedAt = $now - 600
+        (Invoke-ClaudeLoginRenewal $cred $cache $now).State | Should -Be 'waiting'
     }
 
-    It 'leaves no temporary file behind' {
-        $null = Save-ClaudeTokens $cred 'old-refresh-1234567890' 'new-access-ABCDEFGHIJ' 'new-refresh-ABCDEFGHIJ' 1800000000000
-        $null = Save-ClaudeTokens $cred 'stale' 'x-access-ABCDEFGHIJKLMNOP' 'x-refresh-ABCDEFGHIJKLMNOP' 1
-        @(Get-ChildItem $TestDrive -Force | Where-Object Name -ne '.credentials.json') | Should -HaveCount 0
+    It 'counts a claude doctor that hangs or fails to start as a failure' {
+        function Invoke-QuietProcess($Exe, $Arguments, $TimeoutSec, $WorkingDirectory) { throw 'claude.exe timed out after 60 s' }
+        $res = Invoke-ClaudeLoginRenewal $cred $cache $now
+        $res.State | Should -Be 'failed'
+        $res.Detail | Should -Match 'timed out'
+        $cache.renewFailures | Should -Be 1
     }
 
-    It 'throws when there is no claudeAiOauth entry, without touching the file' {
-        [IO.File]::WriteAllText($cred, '{"mcpOAuth":{}}')
-        { Save-ClaudeTokens $cred 'a' 'b' 'c' 1 } | Should -Throw
-        [IO.File]::ReadAllText($cred) | Should -Be '{"mcpOAuth":{}}'
+    It 'says so when the claude command is not installed' {
+        function Find-ClaudeExe { $null }
+        (Invoke-ClaudeLoginRenewal $cred $cache $now).State | Should -Be 'missing'
+    }
+
+    It 'never changes the credentials file itself' {
+        function Invoke-QuietProcess($Exe, $Arguments, $TimeoutSec, $WorkingDirectory) { @{ ExitCode = 0; Output = '' } }
+        $null = Invoke-ClaudeLoginRenewal $cred $cache $now
+        (Get-Content $cred -Raw).Trim() | Should -BeExactly $expired
     }
 }
 
@@ -144,6 +169,41 @@ Describe 'Get-WindowForecast' {
     }
 }
 
+Describe 'Update-Claude with an expired login' {
+    BeforeEach {
+        $script:savedConfigDir = $env:CLAUDE_CONFIG_DIR
+        $env:CLAUDE_CONFIG_DIR = $TestDrive
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        Set-Content (Join-Path $TestDrive '.credentials.json') ('{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":' + (($now - 3600) * 1000) + ',"subscriptionType":"pro"}}')
+        function Read-ClaudeCache { @{ fetchedAt = [long]0; blockedUntil = [long]0; body = $null; renewTriedAt = [long]0; renewFailures = 0 } }
+        function Write-ClaudeCache($c) { }
+    }
+    AfterEach { $env:CLAUDE_CONFIG_DIR = $script:savedConfigDir }
+
+    It 'looks at the login file again a minute after a failed renewal' {
+        function Invoke-ClaudeLoginRenewal($CredPath, $Cache, $Now) { @{ State = 'failed'; RetryAt = $Now + 300; Detail = 'offline' } }
+        $u = Update-Claude 5 $false $true
+        $u.Result.Error | Should -Be 'login expired'
+        ($u.NextAt - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) | Should -BeLessOrEqual 61
+        $u.Result.Detail | Should -Match 'Next try at'
+    }
+
+    It 'does not run claude doctor when renewal is off' {
+        function Invoke-ClaudeLoginRenewal($CredPath, $Cache, $Now) { throw 'must not be called' }
+        $u = Update-Claude 5 $false $false
+        $u.Result.Error | Should -Be 'login expired'
+        $u.Result.Detail | Should -Match "Run 'claude' once"
+    }
+}
+
+Describe 'Get-CodexLive timeout' {
+    It 'gives up on a program that never answers, on time' {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        { Get-CodexLive (Join-Path $env:WINDIR 'System32\cmd.exe') 2 } | Should -Throw '*timed out after*waiting for initialize*'
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 8
+    }
+}
+
 Describe 'Update-Codex retry' {
     BeforeEach {
         # Stand-ins, defined in the test's scope so Update-Codex calls them instead.
@@ -195,7 +255,7 @@ Describe 'Read-Settings' {
 
     It 'returns the defaults when there is no file' {
         $s = Read-Settings
-        $s.ClaudeRefreshMinutes | Should -Be 15
+        $s.ClaudeRefreshMinutes | Should -Be 5
         $s.Topmost | Should -BeTrue
         $s.ClaudeAutoRenewLogin | Should -BeNullOrEmpty
         $s.CheckForUpdates | Should -BeNullOrEmpty
@@ -217,6 +277,18 @@ Describe 'Read-Settings' {
         $s.StripOffset | Should -Be 8
         $s.ClaudePlanUsdPerMonth | Should -Be 0
         $s.Contains('Unknown') | Should -BeFalse
+    }
+
+    It 'moves the old default refresh of 15 minutes to 5 once' {
+        Set-Content $SettingsPath '{"ClaudeRefreshMinutes":15}'
+        (Read-Settings).ClaudeRefreshMinutes | Should -Be 5
+    }
+
+    It 'keeps a refresh of 15 minutes chosen after the migration, and other values' {
+        Set-Content $SettingsPath '{"ClaudeRefreshMinutes":15,"SettingsVersion":2}'
+        (Read-Settings).ClaudeRefreshMinutes | Should -Be 15
+        Set-Content $SettingsPath '{"ClaudeRefreshMinutes":30}'
+        (Read-Settings).ClaudeRefreshMinutes | Should -Be 30
     }
 
     It 'keeps the opt-in switches only when they are real booleans' {

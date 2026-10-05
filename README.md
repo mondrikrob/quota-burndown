@@ -166,7 +166,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 
 | What | Source | How often |
 |---|---|---|
-| Claude Code limits | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token Claude Code stores in `~/.claude/.credentials.json` | every 15 min (cached on disk; honors `Retry-After`) |
+| Claude Code limits | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token Claude Code stores in `~/.claude/.credentials.json` | every 5 min (cached on disk; honors `Retry-After`) |
 | Codex limits | `codex app-server --stdio` → JSON-RPC `account/rateLimits/read`. If that fails, it falls back to the `rate_limits` entries in `~/.codex/sessions/**/*.jsonl` | every 3 min |
 | Tokens burned | Parsed from `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl` (read incrementally) | every minute |
 | Run-out forecast | Your burn rate from `history.csv`: the last hour for the 5-hour window, the last 24 h for the weekly one. If there isn't enough history yet, it uses the average since the window started | every minute |
@@ -174,7 +174,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 
 Notes:
 
-- **The Claude usage endpoint rate-limits aggressively.** A 429 can lock you out for about an hour, so don't set `ClaudeRefreshMinutes` below 10.
+- **The Claude usage endpoint is rate-limited.** If it answers 429, the widget waits as long as it's told (this can be up to an hour) and keeps showing the last numbers. Every 5 minutes has been fine in testing; if you see "rate limited" often, raise `ClaudeRefreshMinutes`.
 - **Token counts only cover what's logged on this PC.** The % limits also include claude.ai chats, Codex in ChatGPT on the web and other devices. So a window can show a % used with few or zero local tokens, and the API value is a lower bound.
 - **API value is an estimate.** It uses list prices and ignores long-context surcharges, batch discounts and so on.
 
@@ -182,10 +182,8 @@ Notes:
 
 Claude Code's login on your PC (in `~/.claude/.credentials.json`) lasts about 8 hours. The `claude` CLI renews it whenever you run it, but the Claude desktop app never does. So if you mostly use the desktop app, the widget will at some point show **login expired**. You have two options:
 
-- **Run `claude` once** in a terminal (and exit it). This is the default, and it's what the widget asks you to do.
-- **Let the widget renew it.** Answer yes at install, or tick **Renew Claude login automatically** in the menu. The widget then renews the login the way Claude Code does and writes the new tokens back. It changes only those fields and writes the file atomically.
-
-  This is unofficial: the widget presents itself to Anthropic's login server as Claude Code, which may stop working and could be considered against Anthropic's terms. Details in [SECURITY.md](SECURITY.md#automatic-login-renewal-opt-in).
+- **Let the widget renew it** (recommended). Answer yes at install, or tick **Renew Claude login automatically** in the menu. When the login has expired, the widget runs `claude doctor`, Claude Code's own installation check. Claude Code then renews its login itself, as it does whenever you use it. It uses no tokens, and the widget never writes the login file. Details in [SECURITY.md](SECURITY.md#automatic-login-renewal-opt-in).
+- **Run `claude` once** in a terminal (and exit it) when the widget says **login expired**.
 
 ## Settings
 
@@ -193,11 +191,11 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 
 | Setting | Default | |
 |---|---|---|
-| `ClaudeRefreshMinutes` | `15` | Minimum 5; keep it at 10 or more |
+| `ClaudeRefreshMinutes` | `5` | Minimum 5; raise it if you often see "rate limited" |
 | `CodexRefreshMinutes` | `3` | |
 | `ClaudePlanUsdPerMonth` | auto | Overrides the detected plan price (Pro $20, Max 5x $100, Max 20x $200) |
 | `CodexPlanUsdPerMonth` | auto | Overrides the detected plan price (Plus $20, Pro $200) |
-| `ClaudeAutoRenewLogin` | asked at install (off) | Renew an expired Claude Code login; also in the menu |
+| `ClaudeAutoRenewLogin` | asked at install | Run `claude doctor` to renew an expired Claude Code login; also in the menu |
 | `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
@@ -223,14 +221,13 @@ Everything lives in `%USERPROFILE%\.quota-burndown`. It's kept outside AppData o
 See [SECURITY.md](SECURITY.md). In short:
 
 - The only network traffic is to `api.anthropic.com`, plus whatever the Codex CLI itself does to fetch your limits. If you turn on the update check, it also asks `api.github.com` once a day for the latest version number.
-- The Claude OAuth tokens are read from Claude Code's own file and sent only to `api.anthropic.com` over HTTPS. They're never written anywhere else or logged. Only if you turn on automatic login renewal does the widget write renewed tokens back to that same file.
+- The Claude OAuth tokens are read from Claude Code's own file and sent only to `api.anthropic.com` over HTTPS. The widget only reads that file: the tokens are never written anywhere or logged.
 - There is no telemetry.
 
 ## Troubleshooting
 
 - **"login expired":** the Claude Code login on this PC has expired. Run `claude` once in a terminal, or turn on **Renew Claude login automatically** in the menu.
-- **"sign in needed":** Claude Code's saved login can't be renewed (for example, you signed out, or the refresh token was used elsewhere). Run `claude auth login` in a terminal; the widget picks up the new login within a minute.
-- **"login expired" with a retry time** (automatic renewal on): renewal was rate-limited. The widget retries on its own; hover over the status for the next attempt time.
+- **"login expired" with a retry time** (automatic renewal on): `claude doctor` ran but the login is still expired, for example because you were offline or Claude Code needs you to sign in again. The widget checks the login every minute and runs `claude doctor` again after 5 minutes (later every 30 minutes); or run `claude` in a terminal, which asks you to sign in if needed.
 - **"rate limited":** the Claude usage endpoint asked to wait. The widget keeps showing the last values and retries after the requested time.
 - **Codex "not found":** install the Codex desktop app, or make sure `codex.exe` is on `PATH`.
 - **Codex shows "from logs":** the live query failed twice in a row (it retries once at once); you're seeing the latest values recorded in your Codex session logs. Hover over the status for the reason. `widget.log` says which step failed and after how long, for example "timed out after 30s waiting for rate limits" (Codex itself didn't answer) or "error sending request" (Codex couldn't reach its server).
@@ -254,7 +251,7 @@ This removes the shortcuts and the installed copy. Delete `%USERPROFILE%\.quota-
 No. It talks only to `api.anthropic.com` for your Claude limits, and to `api.github.com` once a day only if you turn on the update check. Codex numbers come from the Codex CLI on your PC. There is no telemetry. See [SECURITY.md](SECURITY.md).
 
 **Does checking the limits use up my quota?**
-No. Reading the usage numbers doesn't run a model, so it costs no tokens. The Claude usage endpoint is rate-limited, though, which is why the widget asks at most every 15 minutes by default.
+No. Reading the usage numbers doesn't run a model, so it costs no tokens. The Claude usage endpoint is rate-limited, though, which is why the widget asks at most every 5 minutes and backs off when told to.
 
 **Why does it say "login expired"?**
 Claude Code's login on your PC lasts about 8 hours, and only the `claude` command renews it. Run `claude` once, or turn on automatic renewal; see [Claude login renewal](#claude-login-renewal).
