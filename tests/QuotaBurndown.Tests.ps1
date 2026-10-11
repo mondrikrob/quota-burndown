@@ -209,6 +209,9 @@ Describe 'Update-Claude with an expired login' {
 
 Describe 'Get-CodexLive timeout' {
     It 'gives up on a program that never answers, on time' {
+        # Loading only functions skips the startup that creates the data folder.
+        # Use an existing isolated folder, including on a clean CI runner.
+        Mock Join-Path { $TestDrive } -ParameterFilter { $ChildPath -eq '.quota-burndown' }
         $sw = [Diagnostics.Stopwatch]::StartNew()
         { Get-CodexLive (Join-Path $env:WINDIR 'System32\cmd.exe') 2 } | Should -Throw '*timed out after*waiting for initialize*'
         $sw.Elapsed.TotalSeconds | Should -BeLessThan 8
