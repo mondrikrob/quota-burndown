@@ -6,3 +6,17 @@ desktop.ini
 
 # Release build output (tools/Build-Release.ps1)
 dist/
+
+# Local review downloads, fixtures and rendered previews
+.review/
+
+# User-specific data and credentials
+.env
+.env.*
+!.env.example
+.credentials.json
+auth.json
+settings.json
+claude-usage.json
+update-check.json
+history.csv

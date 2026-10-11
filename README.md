@@ -10,6 +10,8 @@
 [![Latest release](https://img.shields.io/github/v/release/mondrikrob/quota-burndown)](https://github.com/mondrikrob/quota-burndown/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/mondrikrob/quota-burndown)](LICENSE)
 
+[Download for Windows](https://github.com/mondrikrob/quota-burndown/releases/latest) · [Install options](#install) · [Security details](SECURITY.md)
+
 A small Windows desktop widget and taskbar strip that show your **Claude Code** and **OpenAI Codex** usage limits for the **5-hour** and **weekly** windows. For each window it also shows:
 
 - your pace,
@@ -17,7 +19,7 @@ A small Windows desktop widget and taskbar strip that show your **Claude Code** 
 - how many tokens you've burned,
 - what those tokens would have cost on the pay-as-you-go API.
 
-It's a single PowerShell script. There's nothing to install and no dependencies: it runs on the Windows PowerShell 5.1 that ships with Windows 10 and 11.
+It's a single PowerShell script with no additional runtime to install: it uses Windows PowerShell 5.1 and the Windows desktop libraries that ship with Windows 10 and 11. You still need at least one supported provider signed in; see [Requirements](#requirements).
 
 <p>
   <img src="docs/widget-dark.png" width="300" alt="Widget, dark theme">
@@ -26,11 +28,20 @@ It's a single PowerShell script. There's nothing to install and no dependencies:
 
 Taskbar strip: <img src="docs/strip-dark.png" height="40" alt="Taskbar strip">
 
+At 100% (sample data): <img src="docs/limit-reached-strip.png" height="52" alt="All four quota bars exhausted: full red bars with white crosses">
+
+<details>
+<summary>See the widget's limit-reached state (sample data)</summary>
+<img src="docs/limit-reached-dark.png" width="300" alt="Sample widget with a red LIMIT REACHED label for each exhausted window">
+</details>
+
 ## Why
 
 "You've used 62% of your weekly limit" doesn't tell you much on its own. Is that a lot for Thursday evening? Will you run dry on Saturday, or is there room to start a big refactor now? Quota Burndown answers it the way a burndown chart does: it compares what you've used with where an even pace would put you, and projects your recent burn rate to the reset. It sits on the taskbar, so you see it without opening anything. It also shows how much your subscription is worth to you: what the same tokens would have cost on the pay-as-you-go API.
 
-> **Unofficial.** This project is not affiliated with or endorsed by Anthropic or OpenAI. It reads the same usage data that Claude Code's `/usage` command and the Codex CLI use internally. Those endpoints are undocumented and may change at any time.
+> **Unofficial.** This project is not affiliated with or endorsed by Anthropic or OpenAI. Provider interfaces and local log formats can change.
+
+> **Claude integration is experimental.** It reads a Claude Code subscription token to query an undocumented endpoint. Anthropic's [authentication and credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) restricts third-party use of subscription credentials; no explicit allowance for this usage-monitoring approach has been verified. This project does not claim provider approval. Codex uses the documented [App Server interface](https://learn.chatgpt.com/docs/app-server).
 
 ## Features
 
@@ -39,28 +50,31 @@ Taskbar strip: <img src="docs/strip-dark.png" height="40" alt="Taskbar strip">
   - **Run-out warning:** appears only when it matters, based on your recent burn rate (the last hour for the 5-hour window, today for the weekly one):
     - **Red:** you're over the even pace *and* will run out well before the reset, e.g. "⚠ runs out ~17:21, 2h 38m before reset".
     - **Amber "tight":** you'd run out only shortly before the reset, or you're still under the even pace, e.g. "tight: at today's rate, out ~Sun 13:11".
+  - **Limit reached:** at exactly 100%, a red **× LIMIT REACHED** label replaces the forecast warning for that window. It clears when the reset passes or a fresh reading reports less than 100%.
+  - **Stale readings:** values over 15 minutes old are marked stale. Forecasts are withheld for stale readings, provider errors and Codex's session-log fallback.
   - **One summary line per tool:** this week's tokens burned (from local logs), what they'd cost at API list prices, and how that compares with your plan, e.g. "This week 163.8M tokens ≈ $74 · 16.0× plan".
   - **Hover over a row** for the even-pace %, the forecast ("~61% by reset"), its burn rate, the reset date, and the token breakdown (input / output / cache write / cache read).
 - **Taskbar strip.** Four tiny signal bars sit next to the tray icons:
   - **5h** is the 5-hour window and **7d** is the weekly window. Orange labels are Claude Code, white labels are Codex.
   - Red means used and grey means remaining. The white line is the even pace.
   - A red label pill means that window will run out before it resets. An amber outline means it's tight.
+  - A **white × on a full red bar** means the last reading reported **100% used**. A **?** marks unavailable or stale data.
   - Click the strip to show or hide the widget, and drag it to move it along the taskbar.
-- **Tray icon.** The app logo, with all four numbers in its tooltip. Click it to show or hide the widget, or right-click it for the menu.
-- **Usage history.** Every reading is appended to `history.csv`, ready for Excel or Power BI.
-- **Themes.** Follows the Windows light/dark theme, and the strip follows the taskbar's theme.
-- **Hides itself** when a fullscreen app is in front or the taskbar is auto-hidden.
+- **Tray icon.** The app logo, with usage in its tooltip; exhausted windows say **FULL**. Click it to show or hide the widget, or right-click it for the menu.
+- **Usage history.** New readings are appended to `history.csv`, ready for Excel or Power BI. Unchanged readings are recorded at most once every 30 minutes.
+- **Themes.** Uses the Windows light/dark theme at startup, and the strip uses the taskbar's theme. Restart after changing the Windows theme.
+- **The taskbar strip hides** when a fullscreen app is in front or the taskbar is auto-hidden. The desktop widget follows your visibility and always-on-top settings.
 
 ## Alternatives
 
-Several good tools show the same limits. Pick whichever fits; this one focuses on **pace and forecasting**, on a **Windows taskbar strip**. As described in their READMEs in October 2026:
+Other tools also show usage limits. This one focuses on **pace and forecasting** in a **Windows taskbar strip**. Check their current documentation before comparing features:
 
 | Tool | Platform | How it differs from Quota Burndown |
 |---|---|---|
-| [Win-CodexBar](https://github.com/nesszer/Win-CodexBar) | Windows tray (Tauri/Rust) | A Windows port of the macOS CodexBar. Covers far more providers (50+), with usage cards in a tray panel. No even-pace marker or run-out forecast. |
-| [Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | Windows taskbar widget (Rust) | The closest relative: also on the taskbar, and supports more providers and multiple accounts. Shows usage and reset times, but no pace, forecast or token value. |
+| [Win-CodexBar](https://github.com/nesszer/Win-CodexBar) | Windows tray (Tauri/Rust) | Broad provider coverage, usage cards, and provider settings in a tray panel. |
+| [Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | Windows taskbar widget (Rust) | Another taskbar option, with multiple providers and accounts. |
 | [CC Meter](https://pypi.org/project/ccmeter/) | Command line (Python) | Measures what a % of your limit is worth in dollars and tracks over time whether your cap is shrinking. A terminal tool, not a widget. |
-| [Headroom](https://github.com/patwalls/headroom) | macOS menu bar | Session and weekly %, context fill, session cost and a "runs out at this pace" hint. Mac only, Claude only. |
+| [Headroom](https://github.com/patwalls/headroom) | macOS menu bar | Claude Code session and weekly usage in the menu bar. |
 | [BurnRate](https://tommcfarlin.com/burnrate-claude-code-usage/) | macOS menu bar | Mirrors Claude Code's `/usage` bars (session, week, Opus, Sonnet). Mac only. Its author has since recommended Claude Code's status line instead. |
 
 What Quota Burndown adds: the **even-pace target** for every window, a **run-out forecast** from your recent burn rate, **tokens burned and their API value compared with your plan's price**, Claude Code and Codex side by side, a **`history.csv`** you can analyse, and a single readable script with no install or dependencies. What it lacks: other providers, multiple accounts, macOS and Linux.
@@ -81,11 +95,11 @@ Pick one. All three end with the same result: the script in `%USERPROFILE%\.quot
 
 1. From the [latest release](https://github.com/mondrikrob/quota-burndown/releases/latest), download `QuotaBurndown-<version>.zip`.
 2. Optional, but a good habit: [check its SHA-256](#verify-the-download).
-3. Extract the zip, then double-click **`Install.cmd`**. Windows may warn that the file came from the internet; choose **Run**. The installer:
+3. Extract the whole zip to a normal folder, then double-click **`Install.cmd`**. If Windows warns that it came from the internet, run it only after checking the source and checksum. The installer:
    - runs `Unblock-File` on the `QuotaBurndown.ps1` next to it,
    - then runs `QuotaBurndown.ps1 -Install`.
 
-   That's all it does; open it in Notepad to check.
+   Open it in Notepad to check. If either step fails, it shows the error and stops. No administrator rights are required.
 
 ### Option 2: Scoop
 
@@ -114,21 +128,21 @@ To update, run `scoop update quota-burndown`, then `QuotaBurndown -Install` agai
 ### After installing
 
 The first install asks two yes/no questions (both default to **no**, and both can be changed later in the menu):
-- **Renew the Claude Code login automatically?** See [Claude login renewal](#claude-login-renewal) below.
+- **Try Claude login renewal automatically (experimental)?** See [Claude login renewal](#claude-login-renewal) below.
 - **Check for new versions once a day?** The widget then asks GitHub for the latest version number and shows a link if there's a newer one. Nothing is downloaded or installed automatically.
 
 Optional: right-click the widget and choose **Start with Windows**.
 
 `-ExecutionPolicy Bypass` only applies to that one PowerShell process; it doesn't change your system policy. The Start menu shortcut launches the script through `conhost --headless`, so no console window appears.
 
-There are deliberately no `irm ... | iex` one-liners: you always get a file you can read and check before running it. The script isn't code-signed (a certificate costs money); the SHA-256 checksums are the way to make sure you got the published file.
+There are deliberately no `irm ... | iex` one-liners: you get a file you can read before running it. The script isn't code-signed. SHA-256 verifies that the download matches the published checksum; it does not prove the code is safe or protect against a compromised publisher account. Managed PCs may require a signed script under their organisation's policy.
 
 ### Verify the download
 
 Each release lists the SHA-256 of every file in its notes and in `SHA256SUMS.txt`. Compare them with:
 
 ```powershell
-Get-FileHash .\QuotaBurndown-1.3.1.zip -Algorithm SHA256
+Get-FileHash .\QuotaBurndown-1.6.0.zip -Algorithm SHA256
 ```
 
 The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn't matter).
@@ -139,6 +153,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 - **Move:** drag it.
 - **Refresh:** double-click it, or use the refresh button.
 - **Minimize:** the minimize button hides it so only the taskbar strip remains.
+- **Keyboard:** Tab reaches the buttons; F5 refreshes, Escape hides the widget, and Shift+F10 opens the menu while the widget has focus.
 
 **Right-click menu** (on the widget, the strip or the tray icon)
 - Show/Hide widget
@@ -148,7 +163,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 - Show on all taskbars (also on other monitors' taskbars)
 - Reset taskbar position
 - Start with Windows
-- Renew Claude login automatically
+- Try Claude login renewal (experimental)
 - Check for updates daily
 - Update available (only when there is one; opens the release page)
 - Open data folder
@@ -175,15 +190,16 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 Notes:
 
 - **The Claude usage endpoint is rate-limited.** If it answers 429, the widget waits as long as it's told (this can be up to an hour) and keeps showing the last numbers. Every 5 minutes has been fine in testing; if you see "rate limited" often, raise `ClaudeRefreshMinutes`.
-- **Token counts only cover what's logged on this PC.** The % limits also include claude.ai chats, Codex in ChatGPT on the web and other devices. So a window can show a % used with few or zero local tokens, and the API value is a lower bound.
-- **API value is an estimate.** It uses list prices and ignores long-context surcharges, batch discounts and so on.
+- **Token counts only cover what's logged on this PC.** The % limits also include provider usage on other devices. A window can show a % used with few or zero local tokens. The API value is an estimate of the local records, not a complete account total.
+- **API value is an estimate, not a bill or guaranteed saving.** It uses the script's static price table and ignores long-context surcharges, fast mode, batch discounts, taxes and other modifiers. Unknown models are counted but not priced; the widget then says **priced subtotal** and hides the plan comparison. Local logs can also omit usage or contain inherited session records. Prices need updating as providers change them.
+- **Scope:** Codex currently shows the shared `codex` pool; additional model-specific pools are not shown. Scoped Claude quota rows show percentages and forecasts, but omit token totals rather than attribute every model's tokens to one scope.
 
 ## Claude login renewal
 
-Claude Code's login on your PC (in `~/.claude/.credentials.json`) lasts about 8 hours. The `claude` CLI renews it whenever you run it, but the Claude desktop app never does. So if you mostly use the desktop app, the widget will at some point show **login expired**. You have two options:
+The Claude Code access token on your PC (in `~/.claude/.credentials.json`) can expire. The widget then shows **login expired**. The Claude desktop app uses a separate login, so signing in there does not necessarily restore the widget's access. You have two options:
 
-- **Let the widget renew it** (recommended). Answer yes at install, or tick **Renew Claude login automatically** in the menu. When the login has expired, the widget runs `claude doctor`, Claude Code's own installation check. Claude Code then renews its login itself, as it does whenever you use it. It uses no tokens, and the widget never writes the login file. Details in [SECURITY.md](SECURITY.md#automatic-login-renewal-opt-in).
-- **Run `claude` once** in a terminal (and exit it) when the widget says **login expired**.
+- **Try the experimental renewal helper.** Answer yes at install, or tick **Try Claude login renewal (experimental)** in the menu. It runs `claude doctor`, an official diagnostics command that makes no model request. Some versions may renew the login as a side effect; this is not a documented or guaranteed renewal interface. The widget never writes the login file. Details in [SECURITY.md](SECURITY.md#automatic-login-renewal-opt-in).
+- **Run `claude` in a terminal** and sign in if prompted when the widget says **login expired**, then exit it.
 
 ## Settings
 
@@ -195,7 +211,7 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 | `CodexRefreshMinutes` | `3` | |
 | `ClaudePlanUsdPerMonth` | auto | Overrides the detected plan price (Pro $20, Max 5x $100, Max 20x $200) |
 | `CodexPlanUsdPerMonth` | auto | Overrides the detected plan price (Plus $20, Pro $200) |
-| `ClaudeAutoRenewLogin` | asked at install | Run `claude doctor` to renew an expired Claude Code login; also in the menu |
+| `ClaudeAutoRenewLogin` | asked at install | Try `claude doctor` after login expiry; experimental, renewal not guaranteed; also in the menu |
 | `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
@@ -220,13 +236,13 @@ Everything lives in `%USERPROFILE%\.quota-burndown`. It's kept outside AppData o
 
 See [SECURITY.md](SECURITY.md). In short:
 
-- The only network traffic is to `api.anthropic.com`, plus whatever the Codex CLI itself does to fetch your limits. If you turn on the update check, it also asks `api.github.com` once a day for the latest version number.
-- The Claude OAuth tokens are read from Claude Code's own file and sent only to `api.anthropic.com` over HTTPS. The widget only reads that file: the tokens are never written anywhere or logged.
-- There is no telemetry.
+- Direct widget requests contact `api.anthropic.com`, and optionally `api.github.com` for updates. The official Codex CLI and optional Claude diagnostics helper make their own network requests.
+- The Claude access token is read from Claude Code's file and sent to `api.anthropic.com` over HTTPS. The widget does not write the credentials file or intentionally persist tokens to its cache or log.
+- The widget has no telemetry of its own. Review diagnostics before sharing them.
 
 ## Troubleshooting
 
-- **"login expired":** the Claude Code login on this PC has expired. Run `claude` once in a terminal, or turn on **Renew Claude login automatically** in the menu.
+- **"login expired":** the Claude Code login on this PC has expired. Run `claude` once in a terminal, or turn on **Try Claude login renewal (experimental)** in the menu.
 - **"login expired" with a retry time** (automatic renewal on): `claude doctor` ran but the login is still expired, for example because you were offline or Claude Code needs you to sign in again. The widget checks the login every minute and runs `claude doctor` again after 5 minutes (later every 30 minutes); or run `claude` in a terminal, which asks you to sign in if needed.
 - **"rate limited":** the Claude usage endpoint asked to wait. The widget keeps showing the last values and retries after the requested time.
 - **Codex "not found":** install the Codex desktop app, or make sure `codex.exe` is on `PATH`.
@@ -243,18 +259,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.quota-bur
 
 If you installed with Scoop, also run `scoop uninstall quota-burndown`.
 
-This removes the shortcuts and the installed copy. Delete `%USERPROFILE%\.quota-burndown` to remove settings and history too.
+This removes the shortcuts and the installed copy. Delete `%USERPROFILE%\.quota-burndown` to remove settings and history too. Scoop's installed package is separate; remove it with `scoop uninstall quota-burndown`.
 
 ## FAQ
 
 **Does it send my data anywhere?**
-No. It talks only to `api.anthropic.com` for your Claude limits, and to `api.github.com` once a day only if you turn on the update check. Codex numbers come from the Codex CLI on your PC. There is no telemetry. See [SECURITY.md](SECURITY.md).
+The widget sends your Claude Code access token to `api.anthropic.com` to fetch limits. The official Codex CLI makes its own network requests. Optional update checks contact `api.github.com`, without credentials. The widget does not upload your conversations or local history and has no telemetry of its own. See [SECURITY.md](SECURITY.md).
 
 **Does checking the limits use up my quota?**
 No. Reading the usage numbers doesn't run a model, so it costs no tokens. The Claude usage endpoint is rate-limited, though, which is why the widget asks at most every 5 minutes and backs off when told to.
 
 **Why does it say "login expired"?**
-Claude Code's login on your PC lasts about 8 hours, and only the `claude` command renews it. Run `claude` once, or turn on automatic renewal; see [Claude login renewal](#claude-login-renewal).
+The Claude Code access token can expire. Run `claude` in a terminal and sign in if prompted, or try the experimental diagnostics helper; see [Claude login renewal](#claude-login-renewal).
 
 **Why are the token numbers so low compared with the %?**
 The % counts everything on your account: claude.ai chats, the desktop and mobile apps, other PCs. The token numbers count only what Claude Code and Codex logged on this PC.
@@ -292,7 +308,7 @@ Reviewed in the code, not yet tested on a real Windows 10 PC:
 
 ## Development
 
-`tests\` holds [Pester](https://pester.dev) 5 tests for the parts that matter most for safety and correctness: the credentials-file update, settings validation, the `history.csv` sanitiser and the forecast levels. GitHub Actions runs them on every push, on Windows PowerShell 5.1 and PowerShell 7, together with a parse check and [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) (`PSScriptAnalyzerSettings.psd1` lists the excluded style rules and why).
+`tests\` holds [Pester](https://pester.dev) tests for login-renewal behavior, response validation, exhausted limits, token accounting, bounded subprocess output, settings, history sanitising and forecasts. GitHub Actions runs them on every push, on Windows PowerShell 5.1 and PowerShell 7, together with a parse check and [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer). CI pins Pester 5.7.1 and PSScriptAnalyzer 1.25.0; excluded style rules are explained in `PSScriptAnalyzerSettings.psd1`.
 
 ```powershell
 Invoke-Pester -Path .\tests

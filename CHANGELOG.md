@@ -1,8 +1,18 @@
 # Changelog
 
+## 1.6.0 (2026-10-11)
+
+- **Limit reached is now explicit.** An exhausted window shows a red `× LIMIT REACHED` label in the widget, a white × on its full red taskbar bar, and `FULL` in the tray tooltip. The marker clears after reset or a fresh lower reading.
+- **Clearer missing and stale data.** Unavailable or stale strip readings show `?`; forecasts are suppressed on errors or readings older than 15 minutes. Failed Codex refreshes no longer silently keep an apparently healthy live state.
+- **Security and correctness.** Bound both subprocess output pipes while reading, enforce deadlines even with continuous output, reject malformed usage responses and token syntax, disable HTTP redirects, validate cached update versions, and tighten forced process matching to the installed `-File` argument.
+- **Installation and packaging.** Both consent choices default to no. The installer preserves failure exit codes. Release zips include README, LICENSE and SECURITY; release version input and output-directory replacement are validated.
+- **Pricing.** Correct legacy Opus 4 and Sonnet 5.5 cache prices. Unknown model variants remain unpriced, and partial subtotals do not show a plan multiple. Added current Astra and Luna base prices.
+- **Usability.** Keyboard-accessible buttons, F5 refresh, Escape hide and Shift+F10 menu. Tray text stays within Windows PowerShell 5.1's 63-character limit. Codex session folders use UTC dates.
+- **Release review.** Added response, 100% state, accounting, output-bound, installer-default and packaging regressions; pinned CI dependencies and checkout. Corrected privacy, theme, fullscreen, checksum and provider-support claims. `claude doctor` is a diagnostics command; the earlier claim of guaranteed official renewal is withdrawn. See [the release review](docs/RELEASE_REVIEW.md).
+
 ## 1.5.0 (2026-10-05)
 
-- **Login renewal is now official.** When the Claude Code login has expired, the widget runs `claude doctor`, Claude Code's own installation check, and Claude Code renews its login itself. It uses no tokens. The widget no longer calls Anthropic's token endpoint as if it were Claude Code, and it never writes `~/.claude/.credentials.json` any more. It only reads it. The unofficial renewal code is gone.
+- **Renewal helper moved to `claude doctor`.** The widget stopped calling Anthropic's token endpoint directly and stopped writing `~/.claude/.credentials.json`. Instead it runs Claude Code's diagnostics command when the login expires. **Correction (2026-10-11):** this was originally described as “official login renewal.” Anthropic documents diagnostics, not a guaranteed renewal interface; renewal may be a version-dependent side effect. The helper is experimental and makes no model request.
   - Still opt-in, and asked once at install (now with "yes" as the suggested answer). If you turned it on before, it stays on.
   - While the login is expired, the widget checks the login file every minute, so a renewal shows up at once, whoever did it. If `claude doctor` didn't help (for example right after the PC woke and the network wasn't up yet), it's run again after 5 minutes, twice, and then every 30 minutes.
 - **Fresher Claude numbers.** Claude usage is now fetched every 5 minutes instead of 15. If your `settings.json` still had the old default of 15, it's moved to 5 once. If you'd rather keep 15, set it again afterwards and it stays. When the endpoint answers "rate limited", the widget still waits as long as it's told.

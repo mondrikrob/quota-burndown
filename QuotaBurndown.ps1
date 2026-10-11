@@ -13,8 +13,9 @@
                    The endpoint is undocumented and rate-limits hard (a 429 can carry a
                    ~1 hour Retry-After), so responses are cached on disk and fetched at
                    most every ClaudeRefreshMinutes. The Claude desktop app never renews
-                   that file; if you opt in (ClaudeAutoRenewLogin), an expired login is
-                   renewed by running Claude Code's own `claude doctor`. The widget only
+                   that file; if you opt in (ClaudeAutoRenewLogin), an expired login
+                   may be renewed by running Claude Code's `claude doctor` diagnostics
+                   (a version-dependent side effect, not a supported renewal API). The widget only
                    reads the file (see SECURITY.md). Tokens are never sent to any other
                    host.
       Updates      Opt-in (CheckForUpdates): once a day the latest release number from
@@ -56,7 +57,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.5.0'
+$AppVersion = '1.6.0'
+
+if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
+    throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'
+}
 
 Add-Type -AssemblyName System.Net.Http
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -86,7 +91,7 @@ $DefaultSettings = [ordered]@{
     CodexRefreshMinutes   = 3
     ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
     CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
-    ClaudeAutoRenewLogin  = $null   # run `claude doctor` to renew an expired login; $null = not asked yet (off)
+    ClaudeAutoRenewLogin  = $null   # experimental `claude doctor` renewal attempt; $null = not asked yet (off)
     CheckForUpdates       = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
     SettingsVersion       = 2       # 2: ClaudeRefreshMinutes default lowered from 15 to 5
 }
@@ -162,7 +167,13 @@ $DataLayer = {
     function Format-Title([string]$s) { if ($s) { (Get-Culture).TextInfo.ToTitleCase($s.ToLowerInvariant()) } }
 
     function New-UsageWindow([string]$Label, $Percent, [int]$Minutes, $ResetsAt) {
-        [pscustomobject]@{ Label = $Label; Percent = [double]$Percent; Minutes = $Minutes; ResetsAt = (ConvertTo-Dto $ResetsAt) }
+        $n = 0.0
+        if ($null -eq $Percent -or $Percent -is [bool] -or
+            -not [double]::TryParse([string]$Percent, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or
+            [double]::IsNaN($n) -or [double]::IsInfinity($n) -or $n -lt 0 -or $Minutes -le 0) {
+            throw 'Usage response contains an invalid percentage or window duration.'
+        }
+        [pscustomobject]@{ Label = $Label; Percent = [Math]::Min(100.0, $n); Minutes = $Minutes; ResetsAt = (ConvertTo-Dto $ResetsAt) }
     }
 
     function New-UsageResult([string]$Name) {
@@ -224,20 +235,89 @@ $DataLayer = {
             if ($j.five_hour) { $wins += New-UsageWindow '5-hour' $j.five_hour.utilization 300 $j.five_hour.resets_at }
             if ($j.seven_day) { $wins += New-UsageWindow 'Weekly' $j.seven_day.utilization 10080 $j.seven_day.resets_at }
         }
+        if ($wins.Count -eq 0) { throw 'Claude usage response contains no recognised windows.' }
         , $wins
+    }
+
+    # Drain both pipes concurrently with a hard character limit, including output
+    # without a newline. ReadToEndAsync/ReadLineAsync alone can allocate without bound.
+    function Initialize-ProcessReader {
+        if ('QuotaBurndown.ProcessReader' -as [type]) { return }
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+namespace QuotaBurndown {
+    public sealed class ProcessReader {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CommandLineToArgvW(string command, out int count);
+        [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
+        public static bool RunsScript(string command, string script) {
+            int count;
+            IntPtr argv = CommandLineToArgvW(command, out count);
+            if (argv == IntPtr.Zero) { return false; }
+            try {
+                for (int i = 1; i < count; i++) {
+                    string arg = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size));
+                    if (arg.StartsWith("-c", StringComparison.OrdinalIgnoreCase) ||
+                        arg.StartsWith("-enc", StringComparison.OrdinalIgnoreCase) ||
+                        String.Equals(arg, "-e", StringComparison.OrdinalIgnoreCase) ||
+                        String.Equals(arg, "-ec", StringComparison.OrdinalIgnoreCase)) { return false; }
+                    if (!String.Equals(arg, "-File", StringComparison.OrdinalIgnoreCase)) { continue; }
+                    if (i + 1 >= count) { return false; }
+                    string file = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, (i + 1) * IntPtr.Size));
+                    return String.Equals(file, script, StringComparison.OrdinalIgnoreCase);
+                }
+                return false;
+            } finally { LocalFree(argv); }
+        }
+        private readonly ConcurrentQueue<string> lines = new ConcurrentQueue<string>();
+        private readonly Task pump;
+        public volatile string Error;
+        public bool Completed { get { return pump.IsCompleted; } }
+        public ProcessReader(StreamReader reader, int limit) {
+            pump = Task.Run(async () => {
+                var buffer = new char[4096];
+                var line = new StringBuilder();
+                int total = 0;
+                try {
+                    int count;
+                    while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+                        total += count;
+                        if (total > limit) { Error = "process output exceeded its limit"; return; }
+                        for (int i = 0; i < count; i++) {
+                            if (buffer[i] == '\n') {
+                                lines.Enqueue(line.ToString().TrimEnd('\r'));
+                                line.Clear();
+                            } else { line.Append(buffer[i]); }
+                        }
+                    }
+                    if (line.Length > 0) { lines.Enqueue(line.ToString()); }
+                } catch { Error = "could not read process output"; }
+            });
+        }
+        public bool TryReadLine(out string line) { return lines.TryDequeue(out line); }
+        public string GetText() { return String.Join("\n", lines.ToArray()); }
+    }
+}
+'@
     }
 
     # ----- Claude Code login renewal ------------------------------------------
     # The Claude desktop app keeps its own login and never updates
     # ~/.claude/.credentials.json; only the `claude` CLI renews it, when it runs and
-    # talks to Anthropic. `claude doctor`, Claude Code's own health check, does that
-    # without any model request. So when the login has expired and the user opted
-    # in (ClaudeAutoRenewLogin), the widget runs it and reads the renewed login back.
+    # talks to Anthropic. Some versions of `claude doctor` may renew it as a side
+    # effect, without a model request; this is not a guaranteed renewal interface.
+    # When the user opted in, run the diagnostic and check whether the expiry changed.
     # The widget itself never writes the credentials file.
 
     # Runs a program without a shell or window, with stdin closed (so it can never
     # wait for an answer), a timeout and capped output. Returns @{ ExitCode; Output }.
     function Invoke-QuietProcess([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 15, [string]$WorkingDirectory) {
+        Initialize-ProcessReader
         $psi = [Diagnostics.ProcessStartInfo]::new($Exe, $Arguments)
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
@@ -248,14 +328,18 @@ $DataLayer = {
         $p = [Diagnostics.Process]::Start($psi)
         try {
             $p.StandardInput.Close()
-            $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()
+            $out = [QuotaBurndown.ProcessReader]::new($p.StandardOutput, 65536)
+            $err = [QuotaBurndown.ProcessReader]::new($p.StandardError, 65536)
             # One-second slices against the clock, so time asleep counts (see Get-CodexLive).
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
             while (-not $p.WaitForExit(1000)) {
+                if ($out.Error -or $err.Error) { throw 'Claude diagnostics exceeded its output limit or could not be read.' }
                 if ([DateTime]::UtcNow -ge $deadline) { throw "$([IO.Path]::GetFileName($Exe)) timed out after $TimeoutSec s" }
             }
-            $text = if ($out.Wait(2000)) { $out.Result } else { '' }
-            @{ ExitCode = $p.ExitCode; Output = $(if ($text.Length -gt 65536) { $text.Substring(0, 65536) } else { $text }) }
+            $drainDeadline = [DateTime]::UtcNow.AddSeconds(2)
+            while ((-not $out.Completed -or -not $err.Completed) -and [DateTime]::UtcNow -lt $drainDeadline) { Start-Sleep -Milliseconds 50 }
+            if ($out.Error -or $err.Error) { throw 'Claude diagnostics exceeded its output limit or could not be read.' }
+            @{ ExitCode = $p.ExitCode; Output = $out.GetText() }
         } finally {
             if (-not $p.HasExited) { try { $p.Kill($true) } catch { try { $p.Kill() } catch { } } }
             $p.Dispose()
@@ -349,7 +433,7 @@ $DataLayer = {
             Use-Cache
             $r.Error = 'login expired'
             if (-not $AutoRenew) {
-                $r.Detail = "The Claude Code login on this PC has expired. Run 'claude' once in a terminal, or turn on 'Renew Claude login automatically' in the menu."
+                $r.Detail = "The Claude Code login on this PC has expired. Run 'claude' in a terminal and sign in if prompted, or enable 'Try Claude login renewal (experimental)' in the menu."
                 return @{ Result = $r; NextAt = $now + 60 }
             }
             $renewal = Invoke-ClaudeLoginRenewal $credPath $cache $now
@@ -371,10 +455,19 @@ $DataLayer = {
         }
         if ($cache.renewTriedAt -or $cache.renewFailures) { $cache.renewTriedAt = 0; $cache.renewFailures = 0; Write-ClaudeCache $cache }
         $accessToken = [string]$oauth.accessToken
+        if ($accessToken.Length -gt 8192 -or $accessToken -notmatch '^[A-Za-z0-9._~+/-]+=*$') {
+            Use-Cache
+            $r.Error = 'invalid login'
+            $r.Detail = 'The Claude Code credentials contain an invalid access token. Run claude auth login again.'
+            return @{ Result = $r; NextAt = $now + 60 }
+        }
 
-        $client = [Net.Http.HttpClient]::new()
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false   # authenticated requests stay on the stated host
+        $client = [Net.Http.HttpClient]::new($handler)
         $client.Timeout = [TimeSpan]::FromSeconds(15)
         $client.MaxResponseContentBufferSize = 1MB
+        $req = $null; $res = $null
         try {
             $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.anthropic.com/api/oauth/usage')
             $req.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $accessToken)
@@ -382,13 +475,14 @@ $DataLayer = {
             $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'quota-burndown/' + $AppVersion)
             $res = $client.SendAsync($req).GetAwaiter().GetResult()
             $status = [int]$res.StatusCode
+            $retryAfter = $res.Headers.RetryAfter
             $body = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         } catch {
             Use-Cache
             $r.Error = 'offline'
-            $r.Detail = 'Could not reach api.anthropic.com: ' + $_.Exception.GetBaseException().Message
+            $r.Detail = 'Could not reach api.anthropic.com: ' + $_.Exception.GetBaseException().Message.Replace($accessToken, '[redacted]')
             return @{ Result = $r; NextAt = $now + 120 }
-        } finally { $client.Dispose() }
+        } finally { if ($req) { $req.Dispose() }; if ($res) { $res.Dispose() }; $client.Dispose() }
 
         if ($status -eq 200) {
             try { $wins = ConvertFrom-ClaudeBody $body } catch { $wins = $null }
@@ -414,7 +508,7 @@ $DataLayer = {
         $r.Error = "API error $status"
         if ($status -eq 429) {
             $wait = 1800
-            $ra = $res.Headers.RetryAfter
+            $ra = $retryAfter
             if ($ra -and $ra.Delta) { $wait = [int]$ra.Delta.Value.TotalSeconds + 5 }
             elseif ($ra -and $ra.Date) { $wait = [int]($ra.Date.Value - [DateTimeOffset]::UtcNow).TotalSeconds + 5 }
             $r.Error = 'rate limited'
@@ -459,6 +553,7 @@ $DataLayer = {
     # One live query. Errors say which step stalled and after how long, so a
     # timeout in widget.log can be told apart from a network failure inside Codex.
     function Get-CodexLive([string]$Exe, [int]$TimeoutSec = 30) {
+        Initialize-ProcessReader
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $step = 'starting'
         $psi = [Diagnostics.ProcessStartInfo]::new($Exe, 'app-server --stdio')
@@ -468,31 +563,29 @@ $DataLayer = {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $psi.WorkingDirectory = Join-Path $HOME '.quota-burndown'
         $p = [Diagnostics.Process]::Start($psi)
         try {
-            $null = $p.StandardError.ReadToEndAsync()   # drain so the pipe never blocks
+            $out = [QuotaBurndown.ProcessReader]::new($p.StandardOutput, 4MB)
+            $err = [QuotaBurndown.ProcessReader]::new($p.StandardError, 65536)
             $p.StandardInput.NewLine = "`n"
             $p.StandardInput.AutoFlush = $true
             $p.StandardInput.WriteLine('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"quota-burndown","version":"' + $AppVersion + '"}}}')
             $step = 'initialize'
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
-            $received = 0
             while ($true) {
-                # Wait in one-second slices against the clock: a wait's own timeout doesn't
-                # run while the PC sleeps, so a single long wait could last for hours.
-                $t = $p.StandardOutput.ReadLineAsync()
-                while (-not $t.Wait(1000)) {
-                    if ([DateTime]::UtcNow -lt $deadline) { continue }
+                # Check the deadline even if the child continuously emits complete lines.
+                if ([DateTime]::UtcNow -ge $deadline) {
                     if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec + 60) { throw ('Codex app-server timed out: the PC slept while waiting for {0}' -f $step) }
                     throw ('Codex app-server timed out after {0:0}s waiting for {1}' -f $sw.Elapsed.TotalSeconds, $step)
                 }
-                $line = $t.Result
-                if ($null -eq $line) {
+                if ($out.Error -or $err.Error) { throw 'Codex app-server exceeded its output limit or could not be read' }
+                $line = $null
+                if (-not $out.TryReadLine([ref]$line)) {
+                    if (-not $out.Completed) { Start-Sleep -Milliseconds 50; continue }
                     $code = if ($p.WaitForExit(500)) { $p.ExitCode } else { '?' }
                     throw ('Codex app-server exited (code {0}) after {1:0.0}s during {2}' -f $code, $sw.Elapsed.TotalSeconds, $step)
                 }
-                $received += $line.Length
-                if ($received -gt 4MB) { throw 'Codex app-server sent too much data' }
                 if (-not $line.StartsWith('{')) { continue }
                 try { $m = $line | ConvertFrom-Json } catch { continue }
                 if ($m.id -eq 1) {
@@ -522,7 +615,7 @@ $DataLayer = {
         $root = Join-Path (Get-CodexHome) 'sessions'
         if (-not (Test-Path $root)) { return }
         for ($d = 0; $d -lt $Days; $d++) {
-            $dir = Join-Path $root ('{0:yyyy}\{0:MM}\{0:dd}' -f (Get-Date).AddDays(-$d))
+            $dir = Join-Path $root ('{0:yyyy}\{0:MM}\{0:dd}' -f [DateTime]::UtcNow.AddDays(-$d))
             if (Test-Path $dir) { Get-ChildItem $dir -Filter *.jsonl -File }
         }
     }
@@ -530,7 +623,7 @@ $DataLayer = {
     function Get-CodexFromLogs {
         $files = @(Get-CodexSessionFiles 8 | Sort-Object LastWriteTime -Descending | Select-Object -First 8)
         $now = [DateTimeOffset]::UtcNow
-        $flat = @(); $plan = $null; $newest = $null
+        $flat = @(); $plan = $null
         foreach ($f in $files) {
             try { $lines = (Read-FileTail $f.FullName 262144) -split "`n" } catch { continue }
             for ($i = $lines.Count - 1; $i -ge 0; $i--) {
@@ -538,8 +631,8 @@ $DataLayer = {
                 try { $o = $lines[$i] | ConvertFrom-Json } catch { continue }
                 $rl = $o.payload.rate_limits
                 if (-not $rl) { continue }
-                $at = ConvertTo-Dto $o.timestamp
-                if ($at -and (-not $newest -or $at -gt $newest)) { $newest = $at }
+                if ($rl.limit_id -and $rl.limit_id -ne 'codex') { continue }
+                try { $at = ConvertTo-Dto $o.timestamp } catch { continue }
                 if (-not $plan -and $rl.plan_type) { $plan = [string]$rl.plan_type }
                 foreach ($k in 'primary', 'secondary') {
                     $w = $rl.$k
@@ -555,15 +648,19 @@ $DataLayer = {
         # Concurrent sessions report the same account pool, but a freshly started one
         # can log a zeroed block. Trust the reset time most sessions agree on and take
         # the highest percentage within it (usage only climbs inside a window).
-        $wins = @()
+        $wins = @(); $observedAt = $null; $missingAt = $false
         foreach ($g in ($flat | Group-Object Mins | Sort-Object { [int]$_.Name })) {
             $best = $g.Group | Group-Object Reset |
                 Sort-Object @{ Expression = { $_.Count }; Descending = $true }, @{ Expression = { ($_.Group | Measure-Object -Property At -Maximum).Maximum }; Descending = $true } |
                 Select-Object -First 1
             $pct = ($best.Group | Measure-Object -Property Pct -Maximum).Maximum
+            $chosen = $best.Group | Where-Object Pct -eq $pct | Sort-Object At -Descending | Select-Object -First 1
+            if (-not $chosen.At) { $missingAt = $true }
+            elseif (-not $observedAt -or $chosen.At -lt $observedAt) { $observedAt = $chosen.At }
             $wins += New-UsageWindow (Get-CodexWindowLabel ([int]$g.Name)) $pct ([int]$g.Name) ([long]$best.Name)
         }
-        [pscustomobject]@{ Windows = $wins; Plan = $plan; At = $newest }
+        # Report the oldest selected reading, not an unrelated newer expired record.
+        [pscustomobject]@{ Windows = $wins; Plan = $plan; At = $(if ($missingAt) { $null } else { $observedAt }) }
     }
 
     function Update-Codex([int]$IntervalMin) {
@@ -587,15 +684,18 @@ $DataLayer = {
             if ($live -and $causes.Count) { Write-WidgetLog ('Codex: live query worked on the second try. First try: ' + $causes[0]) }
             try {
                 if (-not $live) { throw ($causes -join '; retry: ') }
-                $rl = $live.rateLimits
-                if (-not $rl -and $live.rateLimitsByLimitId) { $rl = $live.rateLimitsByLimitId.codex }
+                # The legacy view may represent a different model's pool. Prefer the
+                # explicitly named shared Codex pool whenever the map is supplied.
+                $rl = if ($live.rateLimitsByLimitId) { $live.rateLimitsByLimitId.codex } else { $live.rateLimits }
                 if (-not $rl) { throw 'Codex returned no rate limits' }
+                if ($rl.limitId -and $rl.limitId -ne 'codex') { throw 'Codex returned a different model-specific limit pool' }
                 $wins = @()
                 foreach ($w in @($rl.primary, $rl.secondary)) {
                     if ($w -and $w.windowDurationMins) {
                         $wins += New-UsageWindow (Get-CodexWindowLabel ([int]$w.windowDurationMins)) $w.usedPercent ([int]$w.windowDurationMins) $w.resetsAt
                     }
                 }
+                if ($wins.Count -eq 0) { throw 'Codex returned no recognised usage windows' }
                 $r.Windows = $wins
                 if ($rl.planType) { $r.PlanKey = ([string]$rl.planType).ToLowerInvariant(); $r.Plan = Format-Title $rl.planType }
                 $r.UpdatedAt = [DateTimeOffset]::UtcNow
@@ -620,8 +720,10 @@ $DataLayer = {
     }
 
     # ----- prices -----------------------------------------------------------
-    # API list prices in USD per million tokens (September 2026). Used only to
+    # API list prices in USD per million tokens (checked 2026-10-11). Used only to
     # estimate what your usage would have cost on the pay-as-you-go API.
+    # Sources: https://platform.claude.com/docs/en/about-claude/pricing
+    #          https://developers.openai.com/api/docs/pricing
 
     function Get-ClaudePrice([string]$Model) {
         # model prefix, input, output, 5-minute cache write, 1-hour cache write, cache read
@@ -630,19 +732,27 @@ $DataLayer = {
             @('claude-fable-5', 10, 50, 12.5, 20, 1.0), @('claude-mythos-5', 10, 50, 12.5, 20, 1.0),
             @('claude-opus-5-5', 4, 20, 5, 8, 0.20), @('claude-opus-5', 5, 25, 6.25, 10, 0.50),
             @('claude-opus-4-1', 15, 75, 18.75, 30, 1.50), @('claude-opus-4-2025', 15, 75, 18.75, 30, 1.50),
-            @('claude-opus-4', 5, 25, 6.25, 10, 0.50),
-            @('claude-sonnet-5-5', 2, 10, 2.5, 4, 0.20), @('claude-sonnet-5', 2, 10, 2.5, 4, 0.20),
-            @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30), @('claude-haiku-4', 1, 5, 1.25, 2, 0.10)
+            @('claude-opus-4-8', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-7', 5, 25, 6.25, 10, 0.50),
+            @('claude-opus-4-6', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-5', 5, 25, 6.25, 10, 0.50),
+            @('claude-opus-4', 15, 75, 18.75, 30, 1.50),
+            @('claude-sonnet-5-5', 2, 10, 2.5, 4, 0.10), @('claude-sonnet-5', 2, 10, 2.5, 4, 0.20),
+            @('claude-sonnet-4-6', 3, 15, 3.75, 6, 0.30), @('claude-sonnet-4-5', 3, 15, 3.75, 6, 0.30),
+            @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30), @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10),
+            @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
         )
-        foreach ($row in $table) { if ($Model -and $Model.StartsWith($row[0])) { return , $row } }
-        , $table[4]   # unknown model: price it like the current default (Opus 5.5)
+        foreach ($row in $table) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{8}$')) { return , $row }
+        }
+        $null   # do not invent a price for unknown models or variants
     }
 
     function Get-CodexPrice([string]$Model) {
         # model prefix, input, cached input, output
-        $table = @(@('gpt-6.1-sol', 2, 0.10, 10), @('gpt-5.5', 5, 0.50, 30))
-        foreach ($row in $table) { if ($Model -and $Model.StartsWith($row[0])) { return , $row } }
-        , $table[0]
+        $table = @(@('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30))
+        foreach ($row in $table) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{4}-\d{2}-\d{2}$')) { return , $row }
+        }
+        $null
     }
 
     function Get-PlanUsdPerMonth([string]$Tool, [string]$PlanKey) {
@@ -660,20 +770,27 @@ $DataLayer = {
 
     function Read-NewLines($Files, [string]$Path) {
         $st = $Files[$Path]
-        if (-not $st) { $st = @{ Offset = [long]0; Model = ''; Entries = New-Object System.Collections.ArrayList }; $Files[$Path] = $st }
+        if (-not $st) { $st = @{ Offset = [long]0; Model = ''; SkippingLine = $false; Entries = New-Object System.Collections.ArrayList }; $Files[$Path] = $st }
         $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
         try {
-            if ($fs.Length -lt $st.Offset) { $st.Offset = [long]0; $st.Entries.Clear() }   # file was rewritten
+            if ($fs.Length -lt $st.Offset) { $st.Offset = [long]0; $st.Model = ''; $st.SkippingLine = $false; $st.Entries.Clear() }   # file was rewritten
             if ($fs.Length -eq $st.Offset) { return }
             $null = $fs.Seek($st.Offset, 'Begin')
-            $buf = New-Object byte[] ($fs.Length - $st.Offset)
+            $buf = New-Object byte[] ([Math]::Min([long]8MB, $fs.Length - $st.Offset))
             $read = $fs.Read($buf, 0, $buf.Length)
         } finally { $fs.Dispose() }
         if ($read -le 0) { return }
         $last = [Array]::LastIndexOf($buf, [byte]10, $read - 1)
-        if ($last -lt 0) { return }   # no complete line yet
+        if ($last -lt 0) {
+            # Preserve ordinary partial writes. Skip an oversized line in bounded
+            # chunks, then resume at its newline instead of becoming stuck forever.
+            if ($read -eq 8MB -or $st.SkippingLine) { $st.Offset += $read; $st.SkippingLine = $true }
+            return
+        }
+        $start = 0
+        if ($st.SkippingLine) { $start = [Array]::IndexOf($buf, [byte]10, 0, $read) + 1; $st.SkippingLine = $false }
         $st.Offset += $last + 1
-        , ([Text.Encoding]::UTF8.GetString($buf, 0, $last + 1) -split "`n")
+        , ([Text.Encoding]::UTF8.GetString($buf, $start, $last + 1 - $start) -split "`n")
     }
 
     function Get-UsageField([string]$Text, [string]$Name) {
@@ -681,7 +798,7 @@ $DataLayer = {
         if ($m.Success) { [long]$m.Groups[1].Value } else { [long]0 }
     }
 
-    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0 } }
+    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0; Unpriced = [long]0 } }
 
     function Update-ClaudeTokens($State) {
         $root = Join-Path (Get-ClaudeDir) 'projects'
@@ -701,23 +818,26 @@ $DataLayer = {
                 if (-not $l.Contains('"usage":{') -or -not $l.Contains('"type":"assistant"')) { continue }
                 $ts = [regex]::Match($l, '"timestamp":"([^"]+)"', 'RightToLeft')
                 if (-not $ts.Success) { continue }
+                try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
                 $i = $l.IndexOf('"usage":{')
                 $u = $l.Substring($i, [Math]::Min(800, $l.Length - $i))
                 $id = [regex]::Match($l, '"id":"(msg_[^"]+)"')
                 $model = [regex]::Match($l, '"model":"([^"]+)"')
                 $e = [pscustomobject]@{
                     Id         = $(if ($id.Success) { $id.Groups[1].Value } else { $null })
-                    At         = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+                    At         = $at
                     Input      = Get-UsageField $u 'input_tokens'
                     CacheWrite = Get-UsageField $u 'cache_creation_input_tokens'
                     CacheRead  = Get-UsageField $u 'cache_read_input_tokens'
                     Output     = Get-UsageField $u 'output_tokens'
                     Cost       = [double]0
+                    Unpriced   = [long]0
                 }
                 $write1h = Get-UsageField $u 'ephemeral_1h_input_tokens'
                 $write5m = [Math]::Max([long]0, $e.CacheWrite - $write1h)
                 $p = Get-ClaudePrice $(if ($model.Success) { $model.Groups[1].Value } else { '' })
-                $e.Cost = ($e.Input * $p[1] + $e.Output * $p[2] + $write5m * $p[3] + $write1h * $p[4] + $e.CacheRead * $p[5]) / 1e6
+                if ($p) { $e.Cost = ($e.Input * $p[1] + $e.Output * $p[2] + $write5m * $p[3] + $write1h * $p[4] + $e.CacheRead * $p[5]) / 1e6 }
+                else { $e.Unpriced = $e.Input + $e.Output + $e.CacheWrite + $e.CacheRead }
                 $null = $entries.Add($e)
             }
             if ($entries.Count -and $entries[0].At -lt $cut) {
@@ -740,7 +860,7 @@ $DataLayer = {
         }
         $s = New-TokenSum
         foreach ($e in @($byId.Values) + @($anon)) {
-            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
         }
         $s.Total = $s.Input + $s.Output + $s.CacheWrite + $s.CacheRead
         $s
@@ -762,12 +882,13 @@ $DataLayer = {
                 if (-not $l.Contains('"token_count"') -or -not $l.Contains('"total_token_usage":{')) { continue }
                 $ts = [regex]::Match($l, '"timestamp":"([^"]+)"')
                 if (-not $ts.Success) { continue }
+                try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
                 $i = $l.IndexOf('"total_token_usage":{')
                 $j = $l.IndexOf('}', $i)
                 if ($j -lt 0) { continue }
                 $u = $l.Substring($i, $j - $i)
                 $null = $st.Entries.Add([pscustomobject]@{
-                        At     = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+                        At     = $at
                         Input  = Get-UsageField $u 'input_tokens'
                         Cached = Get-UsageField $u 'cached_input_tokens'
                         Output = Get-UsageField $u 'output_tokens'
@@ -793,7 +914,8 @@ $DataLayer = {
                 $p = Get-CodexPrice $e.Model
                 $s.Input += $inTok; $s.CacheRead += $cached; $s.Output += $output
                 $s.Total += $e.Total - $(if ($b) { $b.Total } else { 0 })
-                $s.Cost += ($inTok * $p[1] + $cached * $p[2] + $output * $p[3]) / 1e6
+                if ($p) { $s.Cost += ($inTok * $p[1] + $cached * $p[2] + $output * $p[3]) / 1e6 }
+                else { $s.Unpriced += $inTok + $cached + $output }
                 $prev = $e
             }
         }
@@ -810,6 +932,9 @@ $DataLayer = {
         }
         $out = @{}
         foreach ($w in $wins) {
+            # A scoped Claude quota does not represent all locally logged models.
+            # Omit its token total until we can attribute entries to that scope.
+            if ($Kind -eq 'claude' -and $w.Label -like 'Weekly *') { continue }
             $since = if ($w.ResetsAt -and $w.ResetsAt -gt $now) { $w.ResetsAt.AddMinutes(-$w.Minutes) } else { $now.AddMinutes(-$w.Minutes) }
             $out[$w.Label] = if ($Kind -eq 'claude') { Measure-ClaudeTokens $State $since } else { Measure-CodexTokens $State $since }
         }
@@ -845,7 +970,7 @@ $DataLayer = {
     # Labels come from the APIs: keep the CSV valid (no quotes, commas or line breaks)
     # and inert in spreadsheet apps (no leading = + - @ or tab, however many).
     function ConvertTo-CsvLabel([string]$Label) {
-        ($Label -replace '[",\r\n]', ' ') -replace '^[=+\-@\t]+', ''
+        ($Label -replace '[",\r\n\x00-\x1F]', ' ') -replace '^[\s=+\-@]+', ''
     }
 
     function Add-UsageSample($History, $Last, $Result) {
@@ -878,6 +1003,8 @@ $DataLayer = {
     function Get-WindowForecast($History, [string]$Tool, $w, [Nullable[DateTimeOffset]]$UpdatedAt) {
         $now = [DateTimeOffset]::UtcNow
         if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { return $null }
+        if ($UpdatedAt -and (($now - $UpdatedAt).TotalMinutes -gt 15 -or ($UpdatedAt - $now).TotalMinutes -gt 2)) { return $null }
+        $observedAt = if ($UpdatedAt) { $UpdatedAt } else { $now }
         $reset = $w.ResetsAt.ToUnixTimeSeconds()
         $short = $w.Minutes -le 300
         $lookback = if ($short) { 60 } else { 1440 }
@@ -891,11 +1018,11 @@ $DataLayer = {
             if ($span -ge $(if ($short) { 10 } else { 60 })) { $rate = [Math]::Max(0.0, ($pts[-1].Percent - $pts[0].Percent) / $span) }
         }
         if ($null -eq $rate) {
-            $elapsed = $w.Minutes - ($w.ResetsAt - $now).TotalMinutes
+            $elapsed = $w.Minutes - ($w.ResetsAt - $observedAt).TotalMinutes
             if ($elapsed -lt 5) { return $null }
             $rate = $w.Percent / $elapsed; $method = 'average'
         }
-        $minsLeft = ($w.ResetsAt - $now).TotalMinutes
+        $minsLeft = ($w.ResetsAt - $observedAt).TotalMinutes
         $basis = if ($method -eq 'average') { 'average rate' } elseif ($short) { "last hour's rate" } else { "today's rate" }
         $f = [pscustomobject]@{
             RunsOut = $false; HitAt = $null; RatePerHour = $rate * 60; Method = $method; Lookback = $lookback; Basis = $basis
@@ -903,7 +1030,7 @@ $DataLayer = {
         }
         if ($w.Percent -ge 100) { $f.RunsOut = $true; $f.HitAt = $now }
         elseif ($rate -gt 0) {
-            $hit = $now.AddMinutes((100 - $w.Percent) / $rate)
+            $hit = $observedAt.AddMinutes((100 - $w.Percent) / $rate)
             if ($hit -lt $w.ResetsAt) { $f.RunsOut = $true; $f.HitAt = $hit }
         }
         if ($f.RunsOut) {
@@ -920,7 +1047,7 @@ $DataLayer = {
 
     function Get-Forecasts($History, $Result) {
         $out = @{}
-        if (-not $Result) { return $out }
+        if (-not $Result -or $Result.Error -or -not $Result.UpdatedAt -or $Result.Source -eq 'logs') { return $out }
         foreach ($w in @($Result.Windows)) { $out[$w.Label] = Get-WindowForecast $History $Result.Name $w $Result.UpdatedAt }
         $out
     }
@@ -935,16 +1062,20 @@ $DataLayer = {
     }
 
     # Returns @{ Version = '1.3.1' } when a newer release exists, otherwise $null.
-    # Asks GitHub at most once a day; the answer is remembered in update-check.json.
+    # Asks GitHub daily after success, hourly after failure; the answer is cached.
     function Get-AvailableUpdate([string]$Current) {
         $path = Get-DataFile 'update-check.json'
         $now = Get-UnixNow
         $c = @{ checkedAt = [long]0; latest = '' }
         try { if (Test-Path $path) { $j = Get-Content $path -Raw | ConvertFrom-Json; $c.checkedAt = [long]$j.checkedAt; $c.latest = [string]$j.latest } } catch { }
+        $c.latest = ConvertTo-ReleaseVersion $c.latest
         if ($c.checkedAt -gt $now -or ($now - $c.checkedAt) -ge 86400) {
-            $client = [Net.Http.HttpClient]::new()
+            $handler = [Net.Http.HttpClientHandler]::new()
+            $handler.AllowAutoRedirect = $false
+            $client = [Net.Http.HttpClient]::new($handler)
             $client.Timeout = [TimeSpan]::FromSeconds(10)
             $client.MaxResponseContentBufferSize = 512KB
+            $req = $null; $res = $null
             try {
                 $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.github.com/repos/mondrikrob/quota-burndown/releases/latest')
                 $null = $req.Headers.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
@@ -963,7 +1094,7 @@ $DataLayer = {
             } catch {
                 $c.checkedAt = $now - 86400 + 3600
                 Write-WidgetLog ('Update check: ' + $_.Exception.GetBaseException().Message)
-            } finally { $client.Dispose() }
+            } finally { if ($req) { $req.Dispose() }; if ($res) { $res.Dispose() }; $client.Dispose() }
             try { ([pscustomobject]$c) | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8 } catch { }
         }
         $cur = ConvertTo-ReleaseVersion $Current
@@ -1082,7 +1213,9 @@ if ($Once) {
         foreach ($w in $r.Windows) {
             $t = $tokens[$w.Label]; $f = $forecasts[$w.Label]
             $line = '  {0,-16} {1,5:0}%  resets {2:ddd HH:mm}  tokens {3,7}  ~{4} API' -f $w.Label, $w.Percent, $w.ResetsAt.LocalDateTime, (Format-Tokens $t.Total), (Format-Usd $t.Cost)
-            if ($f -and $f.Level -eq 'alert') { $line += '  RUNS OUT ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
+            if ($t.Unpriced -gt 0) { $line += ' (priced subtotal; ' + (Format-Tokens $t.Unpriced) + ' tokens unpriced)' }
+            if ($w.Percent -ge 100 -and $w.ResetsAt -gt [DateTimeOffset]::UtcNow) { $line += '  LIMIT REACHED' }
+            elseif ($f -and $f.Level -eq 'alert') { $line += '  RUNS OUT ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
             elseif ($f -and $f.Level -eq 'tight') { $line += '  tight: out ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
             elseif ($f) { $line += '  ~{0:0}% by reset' -f $f.Projected }
             Write-Output $line
@@ -1123,8 +1256,9 @@ function Stop-RunningWidget {
     $m.Dispose()
     if ($free) { return }
     # Only processes running the installed copy are touched.
+    Initialize-ProcessReader
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.IndexOf($InstalledScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and [QuotaBurndown.ProcessReader]::RunsScript($_.CommandLine, $InstalledScript) } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 }
 
@@ -1145,12 +1279,12 @@ function Read-YesNo([string]$Text, [bool]$Default = $false) {
 function Request-InstallChoices {
     $changed = $false
     if ($null -eq $Settings.ClaudeAutoRenewLogin) {
-        $Settings.ClaudeAutoRenewLogin = Read-YesNo -Default $true -Text @'
-Renew the Claude Code login automatically?
-  Claude Code's login on this PC lasts about 8 hours. The Claude desktop app does
-  not renew it; only the 'claude' command does, when you run it. When the login has
+        $Settings.ClaudeAutoRenewLogin = Read-YesNo -Text @'
+Try Claude login renewal automatically (experimental)?
+  The Claude Code access token on this PC can expire. When the login has
   expired, Quota Burndown can run 'claude doctor' (Claude Code's own health check,
-  which uses no tokens), and Claude Code renews its login itself.
+  which makes no model request). Some versions may renew the login as a side effect;
+  this is not a guaranteed or supported renewal interface.
   If you answer no, the widget shows "login expired" and you run 'claude' once.
 '@
         $changed = $changed -or ($null -ne $Settings.ClaudeAutoRenewLogin)
@@ -1178,7 +1312,7 @@ if ($Install) {
     Start-Process explorer.exe -ArgumentList ('"{0}"' -f $StartMenuLink)
     Write-Output "Quota Burndown $AppVersion installed to $InstalledScript and started."
     $state = { param($v) if ($v -eq $true) { 'on' } elseif ($v -eq $false) { 'off' } else { 'off (not asked: no console)' } }
-    Write-Output ('  Renew Claude login automatically: {0}' -f (& $state $Settings.ClaudeAutoRenewLogin))
+    Write-Output ('  Try Claude login renewal (experimental): {0}' -f (& $state $Settings.ClaudeAutoRenewLogin))
     Write-Output ('  Check for updates daily:          {0}' -f (& $state $Settings.CheckForUpdates))
     Write-Output '  You can change both later from the widget menu (right-click).'
     return
@@ -1253,6 +1387,10 @@ $WorkerLoop = {
                 $u = Update-Codex $sync.CodexInterval
                 $prev = $sync.Codex
                 if ($u.Result.Source -ne 'live' -and $prev -and $prev.Source -eq 'live' -and ([DateTimeOffset]::UtcNow - $prev.UpdatedAt).TotalMinutes -lt 20) {
+                    $retained = $prev.PSObject.Copy()
+                    $retained.Error = 'stale'
+                    $retained.Detail = 'Live refresh failed; keeping the previous live reading. ' + $u.Result.Detail
+                    $sync.Codex = $retained
                     $codexNext = $now + 60   # a blip in the live query: a recent live reading beats stale log values
                 } else {
                     $sync.Codex = $u.Result; $codexNext = $u.NextAt
@@ -1278,7 +1416,7 @@ $WorkerLoop = {
             $sync.Version++
         }
         if ($sync.CheckUpdates -and $now -ge $updateNext) {
-            # Get-AvailableUpdate itself asks GitHub at most once a day.
+            # Get-AvailableUpdate handles daily checks and hourly retries after failure.
             try { $sync.Update = Get-AvailableUpdate $sync.AppVersion; $sync.Version++ } catch { Write-WidgetLog "Update check: $_" }
             $updateNext = $now + 3600
         }
@@ -1349,19 +1487,20 @@ function Get-Derived([string]$Key, [string]$Tool, [string]$Label) {
 # Flat icon button. The action lives in Tag because event handlers run after this
 # function has returned, so they cannot see its local variables.
 function New-IconButton([string]$Glyph, [string]$Tip, [scriptblock]$Action, $Brushes, [double]$Size = 24) {
-    $b = [Windows.Controls.Border]::new()
-    $b.Width = $Size; $b.Height = $Size - 2; $b.CornerRadius = 4; $b.Background = $HitBrush
+    $b = [Windows.Controls.Button]::new()
+    $b.Width = $Size; $b.Height = $Size; $b.Background = $HitBrush
+    $b.BorderThickness = 0; $b.Padding = 0
     $b.Cursor = [Windows.Input.Cursors]::Hand
     $b.ToolTip = $Tip
+    [Windows.Automation.AutomationProperties]::SetName($b, $Tip)
     $b.Tag = @{ Action = $Action; Hover = $Brushes.Hover }
     $t = New-Text $Glyph $Brushes.Muted 10
     $t.FontFamily = $IconFont
     $t.HorizontalAlignment = 'Center'; $t.VerticalAlignment = 'Center'
-    $b.Child = $t
+    $b.Content = $t
     $b.Add_MouseEnter({ param($s, $e) $s.Background = $s.Tag.Hover })
     $b.Add_MouseLeave({ param($s, $e) $s.Background = $HitBrush })
-    $b.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
-    $b.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; & $s.Tag.Action })
+    $b.Add_Click({ param($s, $e) $e.Handled = $true; & $s.Tag.Action })
     $b
 }
 
@@ -1382,8 +1521,8 @@ function New-IconButton([string]$Glyph, [string]$Tip, [scriptblock]$Action, $Bru
         <StackPanel x:Name="TopButtons" DockPanel.Dock="Right" Orientation="Horizontal"/>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <TextBlock x:Name="TopTitle" Text="QUOTA BURNDOWN" FontSize="10" VerticalAlignment="Center"/>
-          <TextBlock x:Name="UpdateLink" FontSize="10" Margin="8,0,0,0" VerticalAlignment="Center" Cursor="Hand"
-                     TextDecorations="Underline" Visibility="Collapsed"/>
+          <Button x:Name="UpdateLink" FontSize="10" Margin="8,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                  Background="Transparent" BorderThickness="0" Padding="0" Visibility="Collapsed"/>
         </StackPanel>
       </DockPanel>
       <StackPanel x:Name="Root" Width="236" Margin="0,0,6,0"/>
@@ -1399,8 +1538,8 @@ $card.BorderBrush = $B.Border
 $window.FindName('TopTitle').Foreground = $B.Muted
 $updateLink = $window.FindName('UpdateLink')
 $updateLink.Foreground = $B.Ok
-$updateLink.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
-$updateLink.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Open-ReleasePage })
+$updateLink.Add_Click({ param($s, $e) $e.Handled = $true; Open-ReleasePage })
+[Windows.Automation.AutomationProperties]::SetName($updateLink, 'Open the available update on GitHub')
 
 # The page address is built here from a validated version number, never taken from the response.
 function Open-ReleasePage {
@@ -1413,7 +1552,7 @@ function Open-ReleasePage {
 function Update-UpdateLink {
     $u = $sync.Update
     if ($u -and $Settings.CheckForUpdates) {
-        $updateLink.Text = "v$($u.Version) available"
+        $updateLink.Content = "v$($u.Version) available"
         $updateLink.ToolTip = "Quota Burndown $($u.Version) is out (you have $AppVersion). Click to open the release page."
         $updateLink.Visibility = 'Visible'
     } else { $updateLink.Visibility = 'Collapsed' }
@@ -1492,7 +1631,17 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
 
     # Line 3, only when it matters: the run-out warning.
     $f = Get-Derived 'Forecast' $r.Name $w.Label
-    if ($f -and -not $expired -and $f.RunsOut) {
+    if (-not $expired -and $w.Percent -ge 100) {
+        $full = [Windows.Controls.Border]::new()
+        $full.Background = $B.Bad; $full.CornerRadius = 3; $full.Padding = '6,2'; $full.Margin = '0,3,0,0'
+        $full.HorizontalAlignment = 'Left'
+        $label = New-Text ($Sym.Times + ' LIMIT REACHED') (New-Brush '#FFFFFFFF') 11
+        $label.FontWeight = [Windows.FontWeights]::Bold
+        $full.Child = $label
+        [Windows.Automation.AutomationProperties]::SetName($full, ($r.Name + ' ' + $w.Label + ': limit reached, 100 percent used'))
+        $null = $row.Children.Add($full)
+    }
+    elseif ($f -and -not $expired -and $f.RunsOut) {
         $fc = [Windows.Controls.TextBlock]::new()
         $fc.Margin = '0,2,0,0'; $fc.TextWrapping = 'Wrap'
         $when = if (($f.HitAt - $Now).TotalHours -lt 18) { '{0:HH:mm}' -f $f.HitAt.LocalDateTime } else { '{0:ddd HH:mm}' -f $f.HitAt.LocalDateTime }
@@ -1509,6 +1658,7 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
 
     # Everything else on hover.
     $tip = @()
+    if (-not $expired -and $w.Percent -ge 100) { $tip += 'LIMIT REACHED: the last reading reported 100% used. Wait for the reset or check the provider.' }
     if ($expired) { $tip += "$($w.Label): this window has reset; waiting for the next reading." }
     else {
         $tip += '{0}: {1:0}% used' -f $w.Label, $w.Percent
@@ -1525,6 +1675,7 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
         $tip += ''
         $tip += 'Tokens burned on this PC in this window: {0} (~{1} at API prices)' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
         $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $tok.Input), (Format-Tokens $tok.Output), (Format-Tokens $tok.CacheWrite), (Format-Tokens $tok.CacheRead)
+        if ($tok.Unpriced -gt 0) { $tip += (Format-Tokens $tok.Unpriced) + ' tokens have no known model price. The dollar amount is only the priced subtotal.' }
     }
     $tip += ''
     $tip += 'The white tick on the bar marks the even pace.'
@@ -1543,7 +1694,8 @@ function Add-ProviderSection($r, [bool]$First) {
     elseif ($r.UpdatedAt) {
         $age = $now - $r.UpdatedAt
         $status.Text = if ($age.TotalMinutes -lt 1) { 'just now' } else { (Format-Span $age) + ' ago' }
-        if ($r.Source -eq 'logs') { $status.Text = 'from logs ' + $Sym.Dot + ' ' + $status.Text }
+        if ($r.Source -eq 'logs') { $status.Text = 'from logs ' + $Sym.Dot + ' ' + $status.Text; $status.Foreground = $B.Warn }
+        if ($age.TotalMinutes -gt 15) { $status.Text = 'stale ' + $Sym.Dot + ' ' + $status.Text; $status.Foreground = $B.Warn }
     }
     $tips = @()
     if ($r.Detail) { $tips += $r.Detail }
@@ -1576,17 +1728,19 @@ function Add-ProviderSection($r, [bool]$First) {
         Add-Run $v (Format-Tokens $week.Total) $B.Text 11 ([Windows.FontWeights]::SemiBold)
         Add-Run $v (' tokens ' + $Sym.Approx + ' ') $B.Muted 11 $null
         Add-Run $v (Format-UsdShort $week.Cost) $B.Text 11 ([Windows.FontWeights]::SemiBold)
+        if ($week.Unpriced -gt 0) { Add-Run $v ' priced subtotal' $B.Warn 11 $null }
         $tip = @("What the tokens {0} burned on this PC in the current weekly window would cost at API list prices: {1}." -f $r.Name, (Format-Usd $week.Cost))
         $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $week.Input), (Format-Tokens $week.Output), (Format-Tokens $week.CacheWrite), (Format-Tokens $week.CacheRead)
-        if ($plan) {
+        if ($plan -and $week.Unpriced -eq 0) {
             $weekly = $plan * 12 / 52
             $ratio = $week.Cost / $weekly
             Add-Run $v (' ' + $Sym.Dot + ' ') $B.Muted 11 $null
             Add-Run $v ('{0:0.0}{1} plan' -f $ratio, $Sym.Times) $B[$(if ($ratio -ge 1) { 'Ok' } else { 'Muted' })] 11 $null
             $tip += 'Your plan: {0}/month = {1}/week, so this is {2:0.0}{3} its price.' -f (Format-Usd $plan), (Format-Usd $weekly), $ratio, $Sym.Times
-        } else {
+        } elseif (-not $plan) {
             $tip += 'Set {0}PlanUsdPerMonth in settings.json to compare with your plan.' -f $(if ($r.Name -eq 'Claude Code') { 'Claude' } else { 'Codex' })
         }
+        if ($week.Unpriced -gt 0) { $tip += (Format-Tokens $week.Unpriced) + ' tokens have no known model price. The plan comparison is hidden until all tokens are priced.' }
         $tip += $(if ($r.Name -eq 'Claude Code') { "The % limits also count claude.ai chats and other devices; these tokens don't." }
                   else { "The % limits also count Codex in ChatGPT on the web and other devices; these tokens don't, so the real value is higher." })
         $v.ToolTip = $tip -join "`n"
@@ -1622,7 +1776,15 @@ $AlertText = New-Brush '#FFFFFFFF'
 # One vertical "signal" bar: red fill = % used, grey = remaining, white line = even
 # pace. Below it a tiny "5h" / "7d" label in the tool's colour (red when the
 # forecast says the window runs out before it resets).
-function New-SignalBar($w, [DateTimeOffset]$Now, [string]$Label, $LabelBrush, [string]$Level) {
+function Get-LimitState($w, [DateTimeOffset]$Now, [string]$Level) {
+    if (-not $w -or -not $w.ResetsAt -or $w.ResetsAt -le $Now) { return 'unknown' }
+    if ($w.Percent -ge 100) { return 'reached' }
+    if ($Level -in 'alert', 'tight') { return $Level }
+    'ok'
+}
+
+function New-SignalBar($w, [DateTimeOffset]$Now, [string]$Label, $LabelBrush, [string]$Level, [bool]$Uncertain = $false) {
+    $Level = Get-LimitState $w $Now $Level
     $g = [Windows.Controls.Grid]::new()
     $g.Width = $SignalWidth + 2; $g.Height = $SignalHeight
     $track = [Windows.Controls.Border]::new()
@@ -1642,16 +1804,25 @@ function New-SignalBar($w, [DateTimeOffset]$Now, [string]$Label, $LabelBrush, [s
         $pace.Margin = [Windows.Thickness]::new(0, 0, 0, [Math]::Max(0.0, [Math]::Min($SignalHeight - 2.0, $elapsed * $SignalHeight - 1.0)))
         $null = $g.Children.Add($pace)
     }
-    $lbl = New-Text $Label $(if ($Level -eq 'alert') { $AlertText } else { $LabelBrush }) 8.5
+    if ($Level -eq 'reached' -or $Level -eq 'unknown' -or $Uncertain) {
+        $mark = New-Text $(if ($Level -eq 'reached') { $Sym.Times } else { '?' }) $(if ($Level -eq 'reached') { $AlertText } else { $SB.Warn }) 11
+        $mark.FontWeight = [Windows.FontWeights]::Bold
+        $mark.HorizontalAlignment = 'Center'; $mark.VerticalAlignment = 'Center'
+        $null = $g.Children.Add($mark)
+    }
+    $lbl = New-Text $Label $(if ($Level -in 'alert', 'reached') { $AlertText } else { $LabelBrush }) 8.5
+    if ($Level -eq 'reached' -and $Uncertain) { $lbl.Text += '?' }
     $lbl.FontWeight = [Windows.FontWeights]::SemiBold
     $lbl.HorizontalAlignment = 'Center'
     $tag = [Windows.Controls.Border]::new()
     $tag.Margin = '0,1,0,0'; $tag.CornerRadius = 2; $tag.Child = $lbl
     # Red pill = will run out before the reset; amber outline = tight.
-    if ($Level -eq 'alert') { $tag.Background = $SB.Bad }
+    if ($Level -in 'alert', 'reached') { $tag.Background = $SB.Bad }
     elseif ($Level -eq 'tight') { $tag.BorderBrush = $SB.Warn; $tag.BorderThickness = '1' }
     $col = [Windows.Controls.StackPanel]::new()
     $col.Width = 13; $col.Margin = '0.5,0'
+    if ($Level -eq 'reached' -and $Uncertain) { $col.Width = 18 }
+    [Windows.Automation.AutomationProperties]::SetName($col, ($Label + ': ' + $Level))
     $null = $col.Children.Add($g); $null = $col.Children.Add($tag)
     $col
 }
@@ -1664,8 +1835,9 @@ function Update-Strip {
     foreach ($r in @($sync.Claude, $sync.Codex)) {
         if (-not $r) { continue }
         $wins = @($r.Windows)
+        $uncertain = [bool]$r.Error -or $r.Source -eq 'logs' -or (-not $r.UpdatedAt) -or (($now - $r.UpdatedAt).TotalMinutes -gt 15)
         $tone = if ($r.Name -eq 'Claude Code') { $SB.Claude } else { $SB.Text }
-        if ($r.Error -and $wins.Count -eq 0) { $tone = $SB.Warn }
+        if ($uncertain) { $tone = $SB.Warn }
         $specs = @(@('5h', ($wins | Where-Object { $_.Minutes -eq 300 } | Select-Object -First 1)), @('7d', ($wins | Where-Object { $_.Label -eq 'Weekly' } | Select-Object -First 1)))
         foreach ($s in $script:strips) {
             # WPF elements can have only one parent: every strip gets its own bars.
@@ -1674,7 +1846,7 @@ function Update-Strip {
             foreach ($spec in $specs) {
                 $w = $spec[1]
                 $f = if ($w) { Get-Derived 'Forecast' $r.Name $w.Label }
-                $null = $pair.Children.Add((New-SignalBar $w $now $spec[0] $tone $(if ($f) { $f.Level } else { 'ok' })))
+                $null = $pair.Children.Add((New-SignalBar $w $now $spec[0] $tone $(if ($f) { $f.Level } else { 'ok' }) $uncertain))
             }
             $null = $s.Rows.Children.Add($pair)
         }
@@ -1685,6 +1857,7 @@ function Update-Strip {
             if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { continue }
             $el = [Math]::Max(0.0, [Math]::Min(1.0, 1 - (($w.ResetsAt - $now).TotalMinutes / $w.Minutes)))
             $line = '    {0}: {1:0}% used (should be at {2:0}%), resets in {3} ({4})' -f $w.Label, $w.Percent, ($el * 100), (Format-Span ($w.ResetsAt - $now)), (Format-ResetTime $w.ResetsAt)
+            if ($w.Percent -ge 100) { $line = '    LIMIT REACHED - ' + $line.Trim() }
             $tok = Get-Derived 'Tokens' $r.Name $w.Label
             if ($tok) { $line += ', ' + (Format-Tokens $tok.Total) + ' tokens' }
             $f = Get-Derived 'Forecast' $r.Name $w.Label
@@ -1693,10 +1866,13 @@ function Update-Strip {
             $tips += $line
         }
         if ($r.Loading) { $tips += '    loading' + $Sym.Ellipsis } elseif ($r.Error) { $tips += "    $($r.Error)" }
+        if ($r.UpdatedAt) { $tips += '    Last reading: {0:ddd HH:mm} ({1} ago)' -f $r.UpdatedAt.LocalDateTime, (Format-Span ($now - $r.UpdatedAt)) }
+        if ($r.Source -eq 'logs') { $tips += '    Source: local session logs; this may be an older account snapshot.' }
+        if ($r.Detail) { $tips += '    ' + $r.Detail }
     }
     $tips += ''
     $tips += '5h = 5-hour window, 7d = weekly. Orange labels = Claude Code, white = Codex.'
-    $tips += 'Red = used, grey = remaining, white line = even pace. Red label = runs out before the reset; amber outline = tight.'
+    $tips += 'Red = used, grey = remaining, white line = even pace. White x on a full red bar = LIMIT REACHED (100%). Red label = forecast warning; amber outline = tight. ? = unknown or stale.'
     $tips += 'Click to ' + $(if ($window.IsVisible) { 'hide' } else { 'show' }) + ' the widget; drag to move.'
     foreach ($s in $script:strips) { $s.Card.ToolTip = $tips -join "`n" }
 }
@@ -1845,21 +2021,27 @@ $IconPath = Join-Path $DataDir 'quota-burndown.ico'
 try { Save-LogoIcon $IconPath } catch { Write-WidgetLog "Logo: $_" }
 if (Test-Path $IconPath) { $tray.Icon = [Drawing.Icon]::new($IconPath, [Windows.Forms.SystemInformation]::SmallIconSize) }
 
-function Update-Tray {
-    $now = [DateTimeOffset]::UtcNow
+function Get-TrayText($Results, [DateTimeOffset]$Now) {
     $parts = @()
-    foreach ($r in @($sync.Claude, $sync.Codex)) {
+    foreach ($r in @($Results)) {
         if (-not $r) { continue }
         $vals = @()
         foreach ($w in @($r.Windows)) {
             if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { continue }
-            if ($w.Label -eq '5-hour') { $vals += '5h {0:0}%' -f $w.Percent } elseif ($w.Label -eq 'Weekly') { $vals += 'wk {0:0}%' -f $w.Percent }
+            $value = if ($w.Percent -ge 100) { 'FULL' } else { '{0:0}%' -f $w.Percent }
+            if ($w.Label -eq '5-hour') { $vals += '5h ' + $value } elseif ($w.Label -eq 'Weekly') { $vals += 'wk ' + $value }
         }
         $short = if ($r.Name -eq 'Claude Code') { 'Claude' } else { 'Codex' }
-        if ($vals.Count) { $parts += "$short  " + ($vals -join ' / ') } elseif ($r.Error) { $parts += "$short  $($r.Error)" }
+        if ($r.Error -or ($r.UpdatedAt -and ($Now - $r.UpdatedAt).TotalMinutes -gt 15)) { $short += '?' }
+        if ($vals.Count) { $parts += "$short " + ($vals -join '/') } elseif ($r.Error) { $parts += "$short $($r.Error)" }
     }
     $tip = if ($parts.Count) { 'Quota Burndown' + "`n" + ($parts -join "`n") } else { 'Quota Burndown' }
-    $tray.Text = if ($tip.Length -gt 127) { $tip.Substring(0, 127) } else { $tip }
+    # .NET Framework NotifyIcon (Windows PowerShell 5.1) accepts at most 63 chars.
+    if ($tip.Length -gt 63) { $tip.Substring(0, 63) } else { $tip }
+}
+
+function Update-Tray {
+    $tray.Text = Get-TrayText -Results @($sync.Claude, $sync.Codex) -Now ([DateTimeOffset]::UtcNow)
 }
 
 # ----- actions & menus -------------------------------------------------------
@@ -1907,8 +2089,8 @@ $miStripReset = [Windows.Forms.ToolStripMenuItem]::new('Reset taskbar position')
 $miStart = [Windows.Forms.ToolStripMenuItem]::new('Start with Windows')
 foreach ($mi in $miTop, $miStrip, $miStripAll, $miStripReset, $miStart) { $null = $menu.Items.Add($mi) }
 $null = $menu.Items.Add('-')
-$miRenew = [Windows.Forms.ToolStripMenuItem]::new('Renew Claude login automatically')
-$miRenew.ToolTipText = "When the Claude Code login has expired, runs 'claude doctor', which renews it."
+$miRenew = [Windows.Forms.ToolStripMenuItem]::new('Try Claude login renewal (experimental)')
+$miRenew.ToolTipText = "When the login expires, tries 'claude doctor'. Renewal is a version-dependent side effect and is not guaranteed."
 $miUpdates = [Windows.Forms.ToolStripMenuItem]::new('Check for updates daily')
 $miUpdates.ToolTipText = 'Asks api.github.com for the latest release number once a day. Nothing is downloaded.'
 foreach ($mi in $miRenew, $miUpdates) { $null = $menu.Items.Add($mi) }
@@ -1961,6 +2143,14 @@ $window.Add_MouseLeftButtonDown({
         Save-Position
     })
 $window.Add_MouseRightButtonUp({ $menu.Show([Windows.Forms.Cursor]::Position) })
+$window.Add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq 'F5') { Request-Refresh; $e.Handled = $true }
+        elseif ($e.Key -eq 'Escape') { Show-Widget $false; $e.Handled = $true }
+        elseif ($e.Key -eq 'Apps' -or ($e.Key -eq 'F10' -and ([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift))) {
+            $menu.Show([Windows.Forms.Cursor]::Position); $e.Handled = $true
+        }
+    })
 
 $window.Add_Loaded({
         $vl = [Windows.SystemParameters]::VirtualScreenLeft; $vt = [Windows.SystemParameters]::VirtualScreenTop

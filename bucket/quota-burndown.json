@@ -1,10 +1,10 @@
 {
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Windows desktop widget and taskbar strip for Claude Code and Codex usage limits: pace, run-out forecast, tokens burned and API value.",
   "homepage": "https://github.com/mondrikrob/quota-burndown",
   "license": "MIT",
-  "url": "https://github.com/mondrikrob/quota-burndown/releases/download/v1.5.0/QuotaBurndown.ps1",
-  "hash": "300c9682f3179ea83be0417c596ca7457f49836a4d0f3ddf2219265ac6e935c8",
+  "url": "https://github.com/mondrikrob/quota-burndown/releases/download/v1.6.0/QuotaBurndown.ps1",
+  "hash": "3a4a385660b885c74caff29ab0361aeb281ae5db964eb7b048110b49d268b07f",
   "bin": "QuotaBurndown.ps1",
   "notes": [
     "Run 'QuotaBurndown -Install' to add the Start menu entry and start the widget.",

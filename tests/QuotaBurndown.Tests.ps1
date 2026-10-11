@@ -15,7 +15,7 @@ BeforeAll {
     . $dl.Right.Expression.ScriptBlock.GetScriptBlock()
 
     # Settings and formatting helpers live outside the data layer.
-    $top | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in 'ConvertTo-Number', 'Read-Settings', 'Format-ResetTime' } |
+    $top | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in 'ConvertTo-Number', 'Read-Settings', 'Format-ResetTime', 'Get-LimitState', 'Get-TrayText', 'Request-InstallChoices' } |
         ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
     $defaults = $top | Where-Object { $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$DefaultSettings' }
     . ([scriptblock]::Create($defaults.Extent.Text))
@@ -167,6 +167,17 @@ Describe 'Get-WindowForecast' {
         $w = New-Window 50 -5
         Get-WindowForecast (New-Object System.Collections.ArrayList) 'Claude Code' $w $null | Should -BeNullOrEmpty
     }
+
+    It 'does not forecast from a stale reading' {
+        $w = New-Window 40 150
+        Get-WindowForecast (New-History $w 50 20) 'Claude Code' $w ([DateTimeOffset]::UtcNow.AddMinutes(-30)) | Should -BeNullOrEmpty
+    }
+
+    It 'does not forecast a cached result with an error' {
+        $r = New-UsageResult 'Claude Code'
+        $r.Windows = @(New-Window 80 150); $r.UpdatedAt = [DateTimeOffset]::UtcNow; $r.Error = 'offline'
+        (Get-Forecasts (New-Object System.Collections.ArrayList) $r).Count | Should -Be 0
+    }
 }
 
 Describe 'Update-Claude with an expired login' {
@@ -192,7 +203,7 @@ Describe 'Update-Claude with an expired login' {
         function Invoke-ClaudeLoginRenewal($CredPath, $Cache, $Now) { throw 'must not be called' }
         $u = Update-Claude 5 $false $false
         $u.Result.Error | Should -Be 'login expired'
-        $u.Result.Detail | Should -Match "Run 'claude' once"
+        $u.Result.Detail | Should -Match "Run 'claude' in a terminal and sign in if prompted"
     }
 }
 
@@ -246,6 +257,31 @@ Describe 'Update-Codex retry' {
         $r = (Update-Codex 3).Result
         $script:calls | Should -Be 2
         $r.Detail | Should -Match 'exited.*retry: .*exited'
+    }
+
+    It 'prefers the named Codex pool over the legacy pool' {
+        function Get-CodexLive {
+            $answer = New-LiveAnswer
+            $answer | Add-Member NoteProperty rateLimitsByLimitId ([pscustomobject]@{ codex = [pscustomobject]@{
+                limitId = 'codex'; primary = [pscustomobject]@{ windowDurationMins = 300; usedPercent = 73; resetsAt = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeSeconds() }
+            } })
+            $answer
+        }
+        (Update-Codex 3).Result.Windows[0].Percent | Should -Be 73
+    }
+
+    It 'does not present another model-specific pool as the shared Codex limit' {
+        function Get-CodexLive {
+            $answer = New-LiveAnswer
+            $answer | Add-Member NoteProperty rateLimitsByLimitId ([pscustomobject]@{ another = $answer.rateLimits })
+            $answer
+        }
+        (Update-Codex 3).Result.Error | Should -Be 'unavailable'
+    }
+
+    It 'rejects a live response with no windows' {
+        function Get-CodexLive { [pscustomobject]@{ rateLimits = [pscustomobject]@{ planType = 'plus' } } }
+        (Update-Codex 3).Result.Error | Should -Be 'unavailable'
     }
 }
 
@@ -305,6 +341,8 @@ Describe 'ConvertTo-CsvLabel' {
         @{ Name = 'repeated formula characters'; In = '==1+1'; Out = '1+1' }
         @{ Name = 'mixed formula characters'; In = '+-@cmd'; Out = 'cmd' }
         @{ Name = 'a leading tab'; In = "`t=1"; Out = '1' }
+        @{ Name = 'a leading space before a formula'; In = ' =1+1'; Out = '1+1' }
+        @{ Name = 'mixed control characters before a formula'; In = "`r`n`t@cmd"; Out = 'cmd' }
         @{ Name = 'quotes, commas and line breaks'; In = "a,`"b`"`r`nc"; Out = 'a  b   c' }
     ) {
         ConvertTo-CsvLabel $In | Should -Be $Out
@@ -313,6 +351,283 @@ Describe 'ConvertTo-CsvLabel' {
     It 'leaves normal labels alone' {
         ConvertTo-CsvLabel ('Weekly ' + [char]0x00B7 + ' Opus') | Should -Be ('Weekly ' + [char]0x00B7 + ' Opus')
         ConvertTo-CsvLabel '5-hour' | Should -Be '5-hour'
+    }
+}
+
+Describe 'Usage response validation' {
+    It 'rejects invalid percentages: <Name>' -ForEach @(
+        @{ Name = 'missing'; Value = $null }, @{ Name = 'boolean'; Value = $true },
+        @{ Name = 'negative'; Value = -1 }, @{ Name = 'infinite'; Value = 'Infinity' },
+        @{ Name = 'not numeric'; Value = 'abc' }, @{ Name = 'NaN'; Value = 'NaN' }
+    ) {
+        { New-UsageWindow '5-hour' $Value 300 $null } | Should -Throw '*invalid*'
+    }
+    It 'accepts a real zero and exactly 100' {
+        (New-UsageWindow '5-hour' 0 300 $null).Percent | Should -Be 0
+        (New-UsageWindow '5-hour' 100 300 $null).Percent | Should -Be 100
+    }
+    It 'treats over-limit usage as exhausted rather than unavailable' {
+        (New-UsageWindow '5-hour' 101 300 $null).Percent | Should -Be 100
+    }
+    It 'rejects a nonpositive window duration' {
+        { New-UsageWindow 'Weekly' 20 0 $null } | Should -Throw '*invalid*'
+    }
+    It 'rejects an unknown Claude response instead of caching it as success' {
+        { ConvertFrom-ClaudeBody '{"new_schema":true}' } | Should -Throw '*no recognised windows*'
+    }
+    It 'handles both supported Claude response shapes' {
+        $old = ConvertFrom-ClaudeBody '{"five_hour":{"utilization":42,"resets_at":"2026-10-12T12:00:00Z"}}'
+        $new = ConvertFrom-ClaudeBody '{"limits":[{"kind":"session","percent":42,"resets_at":"2026-10-12T12:00:00Z"}]}'
+        $old[0].Percent | Should -Be 42
+        $new[0].Label | Should -Be '5-hour'
+    }
+}
+
+Describe 'Reached limit state' {
+    It 'marks exactly 100 percent as reached even without a forecast' {
+        $now = [DateTimeOffset]::UtcNow
+        $w = New-UsageWindow 'Weekly' 100 10080 $now.AddDays(1)
+        Get-LimitState $w $now 'ok' | Should -Be 'reached'
+    }
+    It 'keeps 99 percent distinct from reached' {
+        $now = [DateTimeOffset]::UtcNow
+        $w = New-UsageWindow '5-hour' 99 300 $now.AddHours(1)
+        Get-LimitState $w $now 'alert' | Should -Be 'alert'
+    }
+    It 'clears the reached state after reset' {
+        $now = [DateTimeOffset]::UtcNow
+        $w = New-UsageWindow '5-hour' 100 300 $now.AddMinutes(-1)
+        Get-LimitState $w $now 'alert' | Should -Be 'unknown'
+    }
+    It 'does not confuse missing data with zero usage' {
+        Get-LimitState $null ([DateTimeOffset]::UtcNow) 'ok' | Should -Be 'unknown'
+    }
+}
+
+Describe 'Tray text compatibility' {
+    It 'fits all four exhausted windows in the PowerShell 5.1 tooltip limit' {
+        $now = [DateTimeOffset]::UtcNow
+        $results = foreach ($name in 'Claude Code', 'Codex') {
+            $r = New-UsageResult $name; $r.UpdatedAt = $now
+            $r.Windows = @(
+                (New-UsageWindow '5-hour' 100 300 $now.AddHours(1))
+                (New-UsageWindow 'Weekly' 100 10080 $now.AddDays(1))
+            )
+            $r
+        }
+        $text = Get-TrayText $results $now
+        $text.Length | Should -BeLessOrEqual 63
+        ([regex]::Matches($text, 'FULL')).Count | Should -Be 4
+    }
+    It 'marks stale values in the tooltip' {
+        $now = [DateTimeOffset]::UtcNow
+        $r = New-UsageResult 'Codex'; $r.UpdatedAt = $now.AddMinutes(-30)
+        $r.Windows = @((New-UsageWindow '5-hour' 40 300 $now.AddHours(1)))
+        Get-TrayText @($r) $now | Should -Match 'Codex\?'
+    }
+}
+
+Describe 'Installer consent defaults' {
+    It 'defaults both choices to no and persists explicit choices' {
+        $Settings = [ordered]@{ ClaudeAutoRenewLogin = $null; CheckForUpdates = $null }
+        $script:choices = @(); $script:saves = 0
+        function Read-YesNo([string]$Text, [bool]$Default = $false) { $script:choices += $Default; $false }
+        function Save-Settings($s) { $script:saves++ }
+        Request-InstallChoices
+        $script:choices | Should -HaveCount 2
+        $script:choices[0] | Should -BeFalse
+        $script:choices[1] | Should -BeFalse
+        $script:saves | Should -Be 1
+    }
+}
+
+Describe 'Model prices and token accounting' {
+    It 'does not attribute all Claude model tokens to a scoped quota' {
+        $r = New-UsageResult 'Claude Code'
+        $r.Windows = @((New-UsageWindow ('Weekly ' + [char]0x00B7 + ' Opus') 40 10080 ([DateTimeOffset]::UtcNow.AddDays(1))))
+        $tokens = Get-WindowTokens $r (New-TokenState) 'claude'
+        $tokens.Count | Should -Be 0
+    }
+    It 'does not guess prices for unknown models or similarly named variants' {
+        Get-ClaudePrice 'claude-future-99' | Should -BeNullOrEmpty
+        Get-ClaudePrice 'claude-opus-4-9' | Should -BeNullOrEmpty
+        Get-CodexPrice 'gpt-future-99' | Should -BeNullOrEmpty
+        Get-CodexPrice 'gpt-5.5-pro' | Should -BeNullOrEmpty
+    }
+    It 'prices legacy Opus 4 correctly and accepts its dated ID' {
+        (Get-ClaudePrice 'claude-opus-4-20250514')[1] | Should -Be 15
+        (Get-ClaudePrice 'claude-opus-4-5')[1] | Should -Be 5
+        (Get-ClaudePrice 'claude-sonnet-5-5')[5] | Should -Be 0.10
+    }
+    It 'counts cumulative Codex increments once and separates cached input' {
+        $now = [DateTimeOffset]::UtcNow
+        $st = New-TokenState
+        $st.Files['fixture'] = @{ Entries = @(
+            [pscustomobject]@{ At = $now.AddHours(-2); Input = 100; Cached = 20; Output = 10; Total = 110; Model = 'gpt-6.1-sol' },
+            [pscustomobject]@{ At = $now; Input = 300; Cached = 70; Output = 50; Total = 350; Model = 'gpt-6.1-sol' },
+            [pscustomobject]@{ At = $now.AddSeconds(1); Input = 300; Cached = 70; Output = 50; Total = 350; Model = 'gpt-6.1-sol' }
+        ) }
+        $sum = Measure-CodexTokens $st $now.AddHours(-1)
+        $sum.Input | Should -Be 150
+        $sum.CacheRead | Should -Be 50
+        $sum.Output | Should -Be 40
+        $sum.Total | Should -Be 240
+        $sum.Cost | Should -Be 0.000705
+    }
+    It 'counts unknown model tokens while leaving them unpriced' {
+        $now = [DateTimeOffset]::UtcNow
+        $st = New-TokenState
+        $st.Files['fixture'] = @{ Entries = @([pscustomobject]@{ At = $now; Input = 100; Cached = 20; Output = 10; Total = 110; Model = 'unknown' }) }
+        $sum = Measure-CodexTokens $st $now.AddHours(-1)
+        $sum.Total | Should -Be 110
+        $sum.Unpriced | Should -Be 110
+        $sum.Cost | Should -Be 0
+    }
+}
+
+Describe 'Incremental log reading' {
+    It 'preserves an incomplete UTF-8 line until the newline arrives' {
+        $file = Join-Path $TestDrive 'partial.jsonl'
+        $state = @{}
+        [IO.File]::WriteAllText($file, 'first' + [char]0x00E9, [Text.UTF8Encoding]::new($false))
+        Read-NewLines $state $file | Should -BeNullOrEmpty
+        $state[$file].Offset | Should -Be 0
+        [IO.File]::AppendAllText($file, "`nnext`n", [Text.UTF8Encoding]::new($false))
+        $lines = Read-NewLines $state $file
+        $lines[0] | Should -Be ('first' + [char]0x00E9)
+        $lines[1] | Should -Be 'next'
+        Read-NewLines $state $file | Should -BeNullOrEmpty
+    }
+    It 'resets entries and model when a file is truncated' {
+        $file = Join-Path $TestDrive 'truncated.jsonl'
+        [IO.File]::WriteAllText($file, "long initial line`n")
+        $state = @{}; $null = Read-NewLines $state $file
+        $state[$file].Model = 'old'; $null = $state[$file].Entries.Add(1)
+        [IO.File]::WriteAllText($file, "new`n")
+        $lines = Read-NewLines $state $file
+        $lines[0] | Should -Be 'new'
+        $state[$file].Model | Should -Be ''
+        $state[$file].Entries.Count | Should -Be 0
+    }
+    It 'reads a large file in bounded chunks without losing complete records' {
+        $file = Join-Path $TestDrive 'large.jsonl'
+        [IO.File]::WriteAllText($file, ('a' * 8MB) + "`ntail`n")
+        $state = @{}
+        $null = Read-NewLines $state $file
+        $state[$file].Offset | Should -Be 8MB
+        $lines = Read-NewLines $state $file
+        $lines[0] | Should -Be 'tail'
+    }
+}
+
+Describe 'Bounded process output' {
+    BeforeAll { Initialize-ProcessReader }
+    It 'rejects a long line without waiting for a newline' {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(('x' * 10000))
+        $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes))
+        try {
+            $pump = [QuotaBurndown.ProcessReader]::new($reader, 100)
+            $deadline = [DateTime]::UtcNow.AddSeconds(3)
+            while (-not $pump.Completed -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 10 }
+            $pump.Completed | Should -BeTrue
+            $pump.Error | Should -Match 'exceeded'
+        } finally { $reader.Dispose() }
+    }
+    It 'returns complete CRLF lines and a trailing partial line' {
+        $reader = [IO.StreamReader]::new([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes("one`r`ntwo")))
+        try {
+            $pump = [QuotaBurndown.ProcessReader]::new($reader, 100)
+            $deadline = [DateTime]::UtcNow.AddSeconds(3)
+            while (-not $pump.Completed -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 10 }
+            $line = $null
+            $pump.TryReadLine([ref]$line) | Should -BeTrue
+            $line | Should -Be 'one'
+            $pump.TryReadLine([ref]$line) | Should -BeTrue
+            $line | Should -Be 'two'
+            $pump.Error | Should -BeNullOrEmpty
+        } finally { $reader.Dispose() }
+    }
+}
+
+Describe 'Forced stop process selection' {
+    BeforeAll { Initialize-ProcessReader }
+    It 'matches the installed script as an actual quoted File argument' {
+        $file = 'C:\Users\Example User\.quota-burndown\QuotaBurndown.ps1'
+        [QuotaBurndown.ProcessReader]::RunsScript(('powershell.exe -NoProfile -File "' + $file + '"'), $file) | Should -BeTrue
+        [QuotaBurndown.ProcessReader]::RunsScript(('powershell.exe -File "' + $file + '.backup"'), $file) | Should -BeFalse
+    }
+    It 'does not stop another command that only mentions the installed path' {
+        $file = 'C:\Users\Example User\.quota-burndown\QuotaBurndown.ps1'
+        [QuotaBurndown.ProcessReader]::RunsScript(('powershell.exe -Command "Write-Output -File ' + $file + '"'), $file) | Should -BeFalse
+        [QuotaBurndown.ProcessReader]::RunsScript(('powershell.exe -c Write-Output -File "' + $file + '"'), $file) | Should -BeFalse
+        [QuotaBurndown.ProcessReader]::RunsScript(('powershell.exe -File "C:\other.ps1" "' + $file + '"'), $file) | Should -BeFalse
+    }
+}
+
+Describe 'Update cache validation' {
+    It 'ignores a malformed cached version without making a network request' {
+        $script:cachePath = Join-Path $TestDrive 'update-check.json'
+        function Get-DataFile { $script:cachePath }
+        [IO.File]::WriteAllText($cachePath, ('{"checkedAt":' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + ',"latest":"broken"}'))
+        Get-AvailableUpdate '1.5.0' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Credential error privacy' {
+    It 'rejects malformed access tokens without echoing them or making a request' {
+        $savedDir = $env:CLAUDE_CONFIG_DIR
+        $env:CLAUDE_CONFIG_DIR = $TestDrive
+        function Read-ClaudeCache { @{ fetchedAt = [long]0; blockedUntil = [long]0; body = $null; renewTriedAt = [long]0; renewFailures = 0 } }
+        try {
+            $fake = 'private-fixture' + "`r`n" + 'value'
+            @{ claudeAiOauth = @{ accessToken = $fake; expiresAt = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeMilliseconds() } } |
+                ConvertTo-Json | Set-Content (Join-Path $TestDrive '.credentials.json')
+            $res = (Update-Claude 5 $false $false).Result
+            $res.Error | Should -Be 'invalid login'
+            $res.Detail | Should -Not -Match 'private-fixture'
+        } finally { $env:CLAUDE_CONFIG_DIR = $savedDir }
+    }
+}
+
+Describe 'Codex session dates' {
+    It 'searches UTC dated folders even when the local date differs' {
+        function Get-CodexHome { $TestDrive }
+        function Get-Date { [DateTime]::UtcNow.AddDays(-1) }
+        $dir = Join-Path (Join-Path $TestDrive 'sessions') ('{0:yyyy}\{0:MM}\{0:dd}' -f [DateTime]::UtcNow)
+        $null = New-Item -ItemType Directory -Force $dir
+        Set-Content (Join-Path $dir 'today.jsonl') '{}'
+        @(Get-CodexSessionFiles 1).Count | Should -Be 1
+    }
+}
+
+Describe 'Codex log fallback trust' {
+    BeforeEach {
+        $script:fallbackFixtureDir = Join-Path $TestDrive ([guid]::NewGuid().ToString())
+        $null = New-Item -ItemType Directory $script:fallbackFixtureDir
+        function Get-CodexSessionFiles { Get-ChildItem $script:fallbackFixtureDir -Filter *.jsonl -File }
+    }
+    It 'does not give an old selected window the timestamp of a newer expired record' {
+        $now = [DateTimeOffset]::UtcNow
+        foreach ($spec in @(@('old', -90, 60, 55), @('expired', 0, -2, 0))) {
+            @{ timestamp = $now.AddMinutes($spec[1]).ToString('o'); payload = @{ rate_limits = @{
+                primary = @{ window_minutes = 300; used_percent = $spec[3]; resets_at = $now.AddMinutes($spec[2]).ToUnixTimeSeconds() }
+            } } } | ConvertTo-Json -Depth 5 -Compress | Set-Content (Join-Path $script:fallbackFixtureDir ($spec[0] + '.jsonl'))
+        }
+        $logs = Get-CodexFromLogs
+        $logs.Windows[0].Percent | Should -Be 55
+        ($now - $logs.At).TotalMinutes | Should -BeGreaterThan 89
+    }
+    It 'ignores a model-specific pool in fallback logs' {
+        $now = [DateTimeOffset]::UtcNow
+        @{ timestamp = $now.ToString('o'); payload = @{ rate_limits = @{ limit_id = 'codex_other';
+            primary = @{ window_minutes = 300; used_percent = 99; resets_at = $now.AddHours(1).ToUnixTimeSeconds() }
+        } } } | ConvertTo-Json -Depth 5 -Compress | Set-Content (Join-Path $script:fallbackFixtureDir 'other.jsonl')
+        Get-CodexFromLogs | Should -BeNullOrEmpty
+    }
+    It 'withholds forecasts for a fallback rather than treating it as live' {
+        $r = New-UsageResult 'Codex'; $r.Source = 'logs'; $r.UpdatedAt = [DateTimeOffset]::UtcNow
+        $r.Windows = @((New-UsageWindow '5-hour' 80 300 ([DateTimeOffset]::UtcNow.AddHours(1))))
+        (Get-Forecasts (New-Object System.Collections.ArrayList) $r).Count | Should -Be 0
     }
 }
 

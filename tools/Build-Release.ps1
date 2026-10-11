@@ -5,14 +5,14 @@
 
 .DESCRIPTION
     dist\QuotaBurndown.ps1                the script, byte for byte
-    dist\QuotaBurndown-<version>.zip      the script plus Install.cmd
+    dist\QuotaBurndown-<version>.zip      script, installer, license and documentation
     dist\SHA256SUMS.txt                   SHA-256 of both, in `sha256sum` format
     bucket\quota-burndown.json            version, URL and hash updated
 
     Then: commit, push, and
     gh release create v<version> dist\QuotaBurndown.ps1 dist\QuotaBurndown-<version>.zip dist\SHA256SUMS.txt
 #>
-param([Parameter(Mandatory)][string]$Version)
+param([Parameter(Mandatory)][ValidatePattern('^\d{1,4}\.\d{1,4}\.\d{1,6}$')][string]$Version)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 $script = Join-Path $root 'QuotaBurndown.ps1'
@@ -21,7 +21,14 @@ $m = [regex]::Match([IO.File]::ReadAllText($script), "(?m)^\`$AppVersion = '([^'
 if ($m.Groups[1].Value -ne $Version) { throw "QuotaBurndown.ps1 says version '$($m.Groups[1].Value)', not '$Version'." }
 
 $dist = Join-Path $root 'dist'
-if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+if (Test-Path $dist) {
+    $target = Get-Item -LiteralPath $dist -Force
+    if ($target.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing to replace a linked dist directory.' }
+    $resolved = (Resolve-Path -LiteralPath $dist).Path
+    $expected = [IO.Path]::GetFullPath((Join-Path $root 'dist'))
+    if (-not [string]::Equals($resolved, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw 'Release output must stay in this repository.' }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
 $null = New-Item -ItemType Directory $dist
 Copy-Item $script $dist
 
@@ -36,6 +43,12 @@ try {
     $entry = $zip.CreateEntry('Install.cmd')
     $w = [IO.StreamWriter]::new($entry.Open(), [Text.Encoding]::ASCII)
     try { $w.Write($cmdText) } finally { $w.Dispose() }
+    foreach ($name in 'README.md', 'LICENSE', 'SECURITY.md') {
+        $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $root $name), $name)
+    }
+    foreach ($asset in (Get-ChildItem -LiteralPath (Join-Path $root 'docs') -File | Where-Object Extension -in '.png', '.md')) {
+        $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $asset.FullName, ('docs/' + $asset.Name))
+    }
 } finally { $zip.Dispose() }
 
 $sums = foreach ($f in 'QuotaBurndown.ps1', $zipName) {
