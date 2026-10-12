@@ -32,7 +32,8 @@
     Print the current numbers to the console and exit.
 
 .PARAMETER Install
-    Copy this script to ~/.quota-burndown, create a Start menu shortcut and (re)start the widget.
+    Copy this script to ~/.quota-burndown, create a Start menu shortcut (and, if you agree,
+    a Startup folder shortcut) and (re)start the widget.
 
 .PARAMETER Uninstall
     Stop the widget and remove its shortcuts and installed copy. Settings and history are kept.
@@ -57,7 +58,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.6.0'
+$AppVersion = '1.7.0'
 
 if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
     throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'
@@ -93,6 +94,7 @@ $DefaultSettings = [ordered]@{
     CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
     ClaudeAutoRenewLogin  = $null   # experimental `claude doctor` renewal attempt; $null = not asked yet (off)
     CheckForUpdates       = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
+    StartWithWindows      = $null   # Startup folder shortcut, asked at install; $null = not asked yet
     SettingsVersion       = 2       # 2: ClaudeRefreshMinutes default lowered from 15 to 5
 }
 
@@ -117,7 +119,7 @@ function Read-Settings {
     }
     # The file is hand-editable: never trust its types or ranges.
     foreach ($k in 'Topmost', 'Visible', 'StripVisible', 'StripAllTaskbars') { if ($s[$k] -isnot [bool]) { $s[$k] = $DefaultSettings[$k] } }
-    foreach ($k in 'ClaudeAutoRenewLogin', 'CheckForUpdates') { if ($s[$k] -isnot [bool]) { $s[$k] = $null } }   # opt-in: anything else means "not asked"
+    foreach ($k in 'ClaudeAutoRenewLogin', 'CheckForUpdates', 'StartWithWindows') { if ($s[$k] -isnot [bool]) { $s[$k] = $null } }   # opt-in: anything else means "not asked"
     $s.Left = ConvertTo-Number $s.Left $null -100000 100000
     $s.Top = ConvertTo-Number $s.Top $null -100000 100000
     $s.StripOffset = ConvertTo-Number $s.StripOffset 8 -10000 10000
@@ -1298,6 +1300,17 @@ Check for new versions once a day?
 '@
         $changed = $changed -or ($null -ne $Settings.CheckForUpdates)
     }
+    if ($null -eq $Settings.StartWithWindows) {
+        # Someone who already ticked "Start with Windows" in the menu isn't asked.
+        $Settings.StartWithWindows = if (Test-Path $StartupLink) { $true } else {
+            Read-YesNo -Default $true @'
+Start Quota Burndown when you sign in to Windows?
+  Adds a shortcut to your Startup folder. You can change this later with
+  "Start with Windows" in the widget menu (right-click).
+'@
+        }
+        $changed = $changed -or ($null -ne $Settings.StartWithWindows)
+    }
     if ($changed) { Save-Settings $Settings }
 }
 
@@ -1307,14 +1320,15 @@ if ($Install) {
     Request-InstallChoices
     if ((Resolve-Path $PSCommandPath).Path -ne $InstalledScript) { Copy-Item $PSCommandPath $InstalledScript -Force }
     New-LaunchShortcut $StartMenuLink $InstalledScript
-    if (Test-Path $StartupLink) { New-LaunchShortcut $StartupLink $InstalledScript }
+    if ($Settings.StartWithWindows -eq $true -or (Test-Path $StartupLink)) { New-LaunchShortcut $StartupLink $InstalledScript }
     # Launch through Explorer so the widget never inherits another app's sandbox.
     Start-Process explorer.exe -ArgumentList ('"{0}"' -f $StartMenuLink)
     Write-Output "Quota Burndown $AppVersion installed to $InstalledScript and started."
     $state = { param($v) if ($v -eq $true) { 'on' } elseif ($v -eq $false) { 'off' } else { 'off (not asked: no console)' } }
     Write-Output ('  Try Claude login renewal (experimental): {0}' -f (& $state $Settings.ClaudeAutoRenewLogin))
     Write-Output ('  Check for updates daily:          {0}' -f (& $state $Settings.CheckForUpdates))
-    Write-Output '  You can change both later from the widget menu (right-click).'
+    Write-Output ('  Start with Windows:               {0}' -f $(if (Test-Path $StartupLink) { 'on' } else { 'off' }))
+    Write-Output '  You can change all three later from the widget menu (right-click).'
     return
 }
 
@@ -2048,6 +2062,7 @@ function Update-Tray {
 
 function Set-Autostart([bool]$On) {
     if ($On) { New-LaunchShortcut $StartupLink } elseif (Test-Path $StartupLink) { Remove-Item $StartupLink -Force }
+    $Settings.StartWithWindows = $On; Save-Settings $Settings
 }
 
 function Save-Position {

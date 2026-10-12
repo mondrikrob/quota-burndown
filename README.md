@@ -127,11 +127,12 @@ To update, run `scoop update quota-burndown`, then `QuotaBurndown -Install` agai
 
 ### After installing
 
-The first install asks two yes/no questions (both default to **no**, and both can be changed later in the menu):
+The first install asks three yes/no questions (all can be changed later in the menu):
 - **Try Claude login renewal automatically (experimental)?** See [Claude login renewal](#claude-login-renewal) below.
 - **Check for new versions once a day?** The widget then asks GitHub for the latest version number and shows a link if there's a newer one. Nothing is downloaded or installed automatically.
+- **Start Quota Burndown when you sign in to Windows?** Defaults to **yes**; adds a shortcut to your Startup folder. Not asked if **Start with Windows** is already ticked in the menu.
 
-Optional: right-click the widget and choose **Start with Windows**.
+The first two default to **no**.
 
 `-ExecutionPolicy Bypass` only applies to that one PowerShell process; it doesn't change your system policy. The Start menu shortcut launches the script through `conhost --headless`, so no console window appears.
 
@@ -142,7 +143,7 @@ There are deliberately no `irm ... | iex` one-liners: you get a file you can rea
 Each release lists the SHA-256 of every file in its notes and in `SHA256SUMS.txt`. Compare them with:
 
 ```powershell
-Get-FileHash .\QuotaBurndown-1.6.0.zip -Algorithm SHA256
+Get-FileHash .\QuotaBurndown-1.7.0.zip -Algorithm SHA256
 ```
 
 The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn't matter).
@@ -213,6 +214,7 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 | `CodexPlanUsdPerMonth` | auto | Overrides the detected plan price (Plus $20, Pro $200) |
 | `ClaudeAutoRenewLogin` | asked at install | Try `claude doctor` after login expiry; experimental, renewal not guaranteed; also in the menu |
 | `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
+| `StartWithWindows` | asked at install (on) | Start the widget at sign-in (Startup folder shortcut); use the menu item to change it |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
 | `StripAllTaskbars` | `false` | Also show the strip on the other monitors' taskbars; also in the menu |

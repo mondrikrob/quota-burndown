@@ -431,16 +431,31 @@ Describe 'Tray text compatibility' {
 }
 
 Describe 'Installer consent defaults' {
-    It 'defaults both choices to no and persists explicit choices' {
-        $Settings = [ordered]@{ ClaudeAutoRenewLogin = $null; CheckForUpdates = $null }
+    It 'defaults both consent choices to no, autostart to yes, and persists explicit choices' {
+        $StartupLink = Join-Path $TestDrive 'missing.lnk'
+        $Settings = [ordered]@{ ClaudeAutoRenewLogin = $null; CheckForUpdates = $null; StartWithWindows = $null }
         $script:choices = @(); $script:saves = 0
         function Read-YesNo([string]$Text, [bool]$Default = $false) { $script:choices += $Default; $false }
         function Save-Settings($s) { $script:saves++ }
         Request-InstallChoices
-        $script:choices | Should -HaveCount 2
+        $script:choices | Should -HaveCount 3
         $script:choices[0] | Should -BeFalse
         $script:choices[1] | Should -BeFalse
+        $script:choices[2] | Should -BeTrue
+        $Settings.StartWithWindows | Should -BeFalse
         $script:saves | Should -Be 1
+    }
+
+    It 'does not ask about autostart when the Startup shortcut already exists' {
+        $StartupLink = Join-Path $TestDrive 'existing.lnk'
+        Set-Content $StartupLink ''
+        $Settings = [ordered]@{ ClaudeAutoRenewLogin = $false; CheckForUpdates = $false; StartWithWindows = $null }
+        $script:choices = @()
+        function Read-YesNo([string]$Text, [bool]$Default = $false) { $script:choices += $Default; $false }
+        function Save-Settings($s) { }
+        Request-InstallChoices
+        $script:choices | Should -HaveCount 0
+        $Settings.StartWithWindows | Should -BeTrue
     }
 }
 

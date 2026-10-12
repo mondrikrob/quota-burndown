@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7.0 (2026-10-12)
+
+- **Installer asks about autostart.** `-Install` (and `Install.cmd`) now asks "Start Quota Burndown when you sign in to Windows?", defaulting to yes. Before, autostart was only in the right-click menu, so a fresh install didn't come back after a restart. If **Start with Windows** is already ticked you aren't asked, and the answer is stored as `StartWithWindows` in `settings.json` so reinstalls don't ask again.
+
 ## 1.6.0 (2026-10-11)
 
 - **Limit reached is now explicit.** An exhausted window shows a red `× LIMIT REACHED` label in the widget, a white × on its full red taskbar bar, and `FULL` in the tray tooltip. The marker clears after reset or a fresh lower reading.
