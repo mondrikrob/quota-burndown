@@ -90,6 +90,7 @@ $DefaultSettings = [ordered]@{
     StripAllTaskbars      = $false  # also show the strip on the other monitors' taskbars
     ClaudeRefreshMinutes  = 5       # the Claude usage endpoint rate-limits; a 429 is honoured (Retry-After)
     CodexRefreshMinutes   = 3
+    BankedResetNotifications = $true # new grants and one reminder within 24 hours of expiry
     ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
     CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
     ClaudeAutoRenewLogin  = $null   # experimental `claude doctor` renewal attempt; $null = not asked yet (off)
@@ -181,7 +182,7 @@ $DataLayer = {
     function New-UsageResult([string]$Name) {
         [pscustomobject]@{
             Name = $Name; Plan = $null; PlanKey = $null; Windows = @(); UpdatedAt = $null
-            Source = $null; Error = $null; Detail = $null; Loading = $false
+            Source = $null; Error = $null; Detail = $null; Loading = $false; BankedResets = $null
         }
     }
 
@@ -194,6 +195,82 @@ $DataLayer = {
             $read = $fs.Read($buf, 0, $buf.Length)
             [Text.Encoding]::UTF8.GetString($buf, 0, $read)
         } finally { $fs.Dispose() }
+    }
+
+    function ConvertTo-BankedResets($Payload, [string]$Provider, [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow) {
+        function Read-ResetCount($Value) {
+            $n = 0
+            if ($null -eq $Value -or $Value -is [bool] -or -not [int]::TryParse([string]$Value, [ref]$n) -or $n -lt 0 -or $n -gt 10000) { return $null }
+            $n
+        }
+        $rows = @(); $count = 0
+        if ($Provider -eq 'Claude Code') {
+            $block = $Payload.cedar_ember
+            if (-not $block -or $block.eligible -ne $true -or $null -eq $block.grants) { return $null }
+            foreach ($g in @($block.grants)) {
+                $left = Read-ResetCount $g.resets_left
+                if ($null -eq $left) { return $null }
+                try { $at = ConvertTo-Dto $g.ends_at } catch { return $null }
+                if ($g.ends_at -and -not $at) { return $null }
+                if ($left -le 0 -or ($at -and $at -le $Now)) { continue }
+                $id = if ($g.id) { [string]$g.id } else { '{0}|{1}|{2}' -f $g.label, $g.starts_at, $g.ends_at }
+                $rows += [pscustomobject]@{ Id = $id; Count = [int]$left; ExpiresAt = $at }
+                $count += [int]$left
+            }
+        } else {
+            $block = $Payload.rateLimitResetCredits
+            if (-not $block) { return $null }
+            $value = Read-ResetCount $block.availableCount
+            if ($null -eq $value) { return $null }
+            $count = [int]$value
+            foreach ($g in @($block.credits)) {
+                if (-not $g -or $g.status -ne 'available' -or -not $g.id) { continue }
+                try { $at = ConvertTo-Dto $g.expiresAt } catch { return $null }
+                if ($null -ne $g.expiresAt -and -not $at) { return $null }
+                if ($at -and $at -le $Now) { continue }
+                $rows += [pscustomobject]@{ Id = [string]$g.id; Count = 1; ExpiresAt = $at }
+            }
+        }
+        [pscustomobject]@{ Count = $count; Credits = $rows }
+    }
+
+    function Get-BankedResetEvents($Resets, $Previous, [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow) {
+        $seen = @(); $warned = @(); $events = @()
+        if ($Previous) { $seen = @($Previous.Seen); $warned = @($Previous.Warned) }
+        $added = 0
+        foreach ($g in @($Resets.Credits)) {
+            if ($g.ExpiresAt -and $g.ExpiresAt -le $Now) { continue }
+            if ($Previous -and (@($Previous.Seen).Count -gt 0 -or $Previous.Count -eq 0) -and $g.Id -notin $seen) { $added += $g.Count }
+            if ($g.Id -notin $seen) { $seen += $g.Id }
+            $warningKey = '{0}|{1}' -f $g.Id, $g.ExpiresAt
+            if ($g.ExpiresAt -and ($g.ExpiresAt - $Now).TotalHours -le 24 -and $warningKey -notin $warned) {
+                $events += [pscustomobject]@{ Kind = 'expiry'; Count = $g.Count; ExpiresAt = $g.ExpiresAt }
+                $warned += $warningKey
+            }
+        }
+        # A backend may provide only a count or a capped list of detail rows.
+        if ($Previous) { $added = [Math]::Max($added, $Resets.Count - $Previous.Count) }
+        if ($added -gt 0) { $events = @([pscustomobject]@{ Kind = 'new'; Count = $added; ExpiresAt = $null }) + $events }
+        [pscustomobject]@{
+            Events = $events
+            State = [pscustomobject]@{ Count = $Resets.Count; Seen = @($seen | Select-Object -Last 500); Warned = @($warned | Select-Object -Last 500) }
+        }
+    }
+
+    function Get-ClaudeUsageUserAgent {
+        if (-not $script:claudeUsageUserAgent) {
+            $script:claudeUsageUserAgent = 'quota-burndown/' + $AppVersion
+            try {
+                $exe = Find-ClaudeExe
+                if ($exe) {
+                    $version = Invoke-QuietProcess $exe '--version' 5 (Join-Path $HOME '.quota-burndown')
+                    if ($version.ExitCode -eq 0 -and $version.Output -match '^\s*(\d+\.\d+\.\d+)\s+\(Claude Code\)') {
+                        $script:claudeUsageUserAgent = 'claude-cli/' + $Matches[1] + ' (external, cli) quota-burndown/' + $AppVersion
+                    }
+                }
+            } catch { }
+        }
+        $script:claudeUsageUserAgent
     }
 
     # ----- Claude Code usage ------------------------------------------------
@@ -410,7 +487,11 @@ namespace QuotaBurndown {
 
         function Use-Cache {
             if ($cache.body) {
-                try { $r.Windows = ConvertFrom-ClaudeBody $cache.body; $r.UpdatedAt = [DateTimeOffset]::FromUnixTimeSeconds($cache.fetchedAt) } catch { }
+                try {
+                    $r.Windows = ConvertFrom-ClaudeBody $cache.body
+                    $r.BankedResets = ConvertTo-BankedResets ($cache.body | ConvertFrom-Json) 'Claude Code'
+                    $r.UpdatedAt = [DateTimeOffset]::FromUnixTimeSeconds($cache.fetchedAt)
+                } catch { }
             }
         }
 
@@ -471,10 +552,11 @@ namespace QuotaBurndown {
         $client.MaxResponseContentBufferSize = 1MB
         $req = $null; $res = $null
         try {
-            $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.anthropic.com/api/oauth/usage')
+            $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1')
             $req.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $accessToken)
             $null = $req.Headers.TryAddWithoutValidation('anthropic-beta', 'oauth-2025-04-20')
-            $null = $req.Headers.TryAddWithoutValidation('User-Agent', 'quota-burndown/' + $AppVersion)
+            # The banked-reset block is gated on a recent installed Claude Code version.
+            $null = $req.Headers.TryAddWithoutValidation('User-Agent', (Get-ClaudeUsageUserAgent))
             $res = $client.SendAsync($req).GetAwaiter().GetResult()
             $status = [int]$res.StatusCode
             $retryAfter = $res.Headers.RetryAfter
@@ -492,6 +574,7 @@ namespace QuotaBurndown {
                 $cache.fetchedAt = $now; $cache.blockedUntil = 0; $cache.body = $body
                 Write-ClaudeCache $cache
                 $r.Windows = $wins; $r.UpdatedAt = [DateTimeOffset]::FromUnixTimeSeconds($now)
+                $r.BankedResets = ConvertTo-BankedResets ($body | ConvertFrom-Json) 'Claude Code'
                 return @{ Result = $r; NextAt = $now + $interval }
             }
             Use-Cache
@@ -699,6 +782,7 @@ namespace QuotaBurndown {
                 }
                 if ($wins.Count -eq 0) { throw 'Codex returned no recognised usage windows' }
                 $r.Windows = $wins
+                $r.BankedResets = ConvertTo-BankedResets $live 'Codex'
                 if ($rl.planType) { $r.PlanKey = ([string]$rl.planType).ToLowerInvariant(); $r.Plan = Format-Title $rl.planType }
                 $r.UpdatedAt = [DateTimeOffset]::UtcNow
                 $r.Source = 'live'
@@ -1723,6 +1807,17 @@ function Add-ProviderSection($r, [bool]$First) {
     $null = $header.Children.Add($title)
     $null = $root.Children.Add($header)
 
+    $resetText = Get-BankedResetText $r $now
+    if ($resetText) {
+        $resetLine = New-Text $resetText $B.Muted 11
+        $resetLine.Margin = '0,4,0,0'
+        $resetLine.ToolTip = 'Click to open the usage page and apply a reset.'
+        $resetLine.Cursor = [Windows.Input.Cursors]::Hand
+        $resetLine.Tag = if ($r.Name -eq 'Claude Code') { 'https://claude.ai/settings/usage' } else { 'https://chatgpt.com/codex/settings/usage' }
+        $resetLine.Add_MouseLeftButtonUp({ param($s, $e) Start-Process $s.Tag; $e.Handled = $true })
+        $null = $root.Children.Add($resetLine)
+    }
+
     if (-not $r.Loading -and @($r.Windows).Count -eq 0) {
         $msg = New-Text $(if ($r.Detail) { $r.Detail } else { 'No usage data yet.' }) $B.Muted 11
         $msg.TextWrapping = 'Wrap'; $msg.Margin = '0,4,0,0'
@@ -1867,6 +1962,8 @@ function Update-Strip {
         $first = $false
 
         $tips += $r.Name + $(if ($r.Plan) { " ($($r.Plan))" })
+        $resetTip = Get-BankedResetText $r $now
+        if ($resetTip) { $tips += '    ' + $resetTip }
         foreach ($w in $wins) {
             if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { continue }
             $el = [Math]::Max(0.0, [Math]::Min(1.0, 1 - (($w.ResetsAt - $now).TotalMinutes / $w.Minutes)))
@@ -2058,6 +2155,69 @@ function Update-Tray {
     $tray.Text = Get-TrayText -Results @($sync.Claude, $sync.Codex) -Now ([DateTimeOffset]::UtcNow)
 }
 
+function Get-BankedResetText($Result, [DateTimeOffset]$Now) {
+    if (-not $Result.BankedResets) { return $null }
+    $count = $Result.BankedResets.Count
+    $dates = @()
+    foreach ($g in @($Result.BankedResets.Credits)) {
+        if ($g.ExpiresAt -and $g.ExpiresAt -le $Now) { $count -= $g.Count }
+        elseif ($g.ExpiresAt) { $dates += $g.ExpiresAt }
+    }
+    $text = '{0} banked reset{1}' -f [Math]::Max(0, $count), $(if ($count -eq 1) { '' } else { 's' })
+    if ($dates.Count) { $text += ' - next expires {0:dd MMM HH:mm}' -f ($dates | Sort-Object | Select-Object -First 1).LocalDateTime }
+    if ($Result.Error -or -not $Result.UpdatedAt -or ($Now - $Result.UpdatedAt).TotalMinutes -gt 15) { $text += ' (stale)' }
+    $text
+}
+
+$script:resetState = @{}
+$script:resetQueue = [Collections.Generic.Queue[object]]::new()
+$script:resetNoticeAt = [DateTimeOffset]::MinValue
+$resetStatePath = Join-Path $DataDir 'banked-reset-notifications.json'
+try {
+    if (Test-Path $resetStatePath) {
+        $savedResetState = Get-Content $resetStatePath -Raw | ConvertFrom-Json
+        foreach ($property in $savedResetState.PSObject.Properties) { $script:resetState[$property.Name] = $property.Value }
+    }
+} catch { Write-WidgetLog 'Could not read banked-reset notification history.' }
+
+function Update-BankedResetNotifications {
+    if ($Snapshot) { return }
+    $now = [DateTimeOffset]::UtcNow
+    $changed = $false
+    foreach ($r in @($sync.Claude, $sync.Codex)) {
+        if (-not $r.BankedResets -or $r.Error -or -not $r.UpdatedAt -or ($now - $r.UpdatedAt).TotalMinutes -gt 15) { continue }
+        $decision = Get-BankedResetEvents $r.BankedResets $script:resetState[$r.Name] $now
+        $encoded = $decision.State | ConvertTo-Json -Depth 4 -Compress
+        if ($encoded -eq ($script:resetState[$r.Name] | ConvertTo-Json -Depth 4 -Compress)) { continue }
+        $script:resetState[$r.Name] = $decision.State
+        $changed = $true
+        if ($Settings.BankedResetNotifications) {
+            foreach ($resetEvent in @($decision.Events)) { $script:resetQueue.Enqueue([pscustomobject]@{ Provider = $r.Name; Event = $resetEvent }) }
+        }
+    }
+    if ($changed) {
+        try {
+            $tempStatePath = $resetStatePath + '.tmp'
+            $script:resetState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempStatePath -Encoding UTF8
+            Move-Item -LiteralPath $tempStatePath -Destination $resetStatePath -Force
+        } catch { Write-WidgetLog 'Could not save banked-reset notification history; alerts may repeat after restart.' }
+    }
+    if (-not $Settings.BankedResetNotifications) { $script:resetQueue.Clear(); return }
+    if ($script:resetQueue.Count -eq 0 -or ($now - $script:resetNoticeAt).TotalSeconds -lt 15) { return }
+    $notice = $script:resetQueue.Dequeue()
+    $resetEvent = $notice.Event
+    if ($resetEvent.Kind -eq 'expiry' -and $resetEvent.ExpiresAt -le $now) { return }
+    $body = if ($resetEvent.Kind -eq 'new') {
+        '{0} new banked reset(s) added. Click to open your usage page.' -f $resetEvent.Count
+    } else {
+        '{0} banked reset(s) expire within 24 hours, on {1:dd MMM HH:mm}. Click to open your usage page.' -f $resetEvent.Count, $resetEvent.ExpiresAt.LocalDateTime
+    }
+    $script:resetNoticeUrl = if ($notice.Provider -eq 'Claude Code') { 'https://claude.ai/settings/usage' } else { 'https://chatgpt.com/codex/settings/usage' }
+    $tray.ShowBalloonTip(10000, ($notice.Provider + ' banked resets'), $body, [Windows.Forms.ToolTipIcon]::Info)
+    $script:resetNoticeAt = $now
+}
+$tray.Add_BalloonTipClicked({ if ($script:resetNoticeUrl) { Start-Process $script:resetNoticeUrl } })
+
 # ----- actions & menus -------------------------------------------------------
 
 function Set-Autostart([bool]$On) {
@@ -2109,6 +2269,11 @@ $miRenew.ToolTipText = "When the login expires, tries 'claude doctor'. Renewal i
 $miUpdates = [Windows.Forms.ToolStripMenuItem]::new('Check for updates daily')
 $miUpdates.ToolTipText = 'Asks api.github.com for the latest release number once a day. Nothing is downloaded.'
 foreach ($mi in $miRenew, $miUpdates) { $null = $menu.Items.Add($mi) }
+$miResetNotifications = $menu.Items.Add('Banked reset notifications')
+$miResetNotifications.Add_Click({
+    $Settings.BankedResetNotifications = -not [bool]$Settings.BankedResetNotifications
+    Save-Settings $Settings
+})
 $miData = $menu.Items.Add('Open data folder')
 $null = $menu.Items.Add('-')
 $miExit = $menu.Items.Add('Exit')
@@ -2123,6 +2288,7 @@ $menu.Add_Opening({
         $miStart.Checked = Test-Path $StartupLink
         $miRenew.Checked = [bool]$Settings.ClaudeAutoRenewLogin
         $miUpdates.Checked = [bool]$Settings.CheckForUpdates
+        $miResetNotifications.Checked = [bool]$Settings.BankedResetNotifications
         $u = $sync.Update
         $hasUpdate = [bool]($u -and $Settings.CheckForUpdates)
         $miUpdate.Visible = $hasUpdate; $miUpdateSep.Visible = $hasUpdate
@@ -2193,6 +2359,7 @@ function Update-View {
     Update-UpdateLink
     Update-Strip
     Update-Tray
+    Update-BankedResetNotifications
     $script:lastRender = [DateTime]::UtcNow
 }
 

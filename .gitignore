@@ -19,4 +19,5 @@ auth.json
 settings.json
 claude-usage.json
 update-check.json
+banked-reset-notifications.json
 history.csv

@@ -15,7 +15,7 @@ The reader loads chunks of local JSONL files into memory to find usage metadata;
 
 ## What it sends over the network
 
-- `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer <Claude Code access token>`, over HTTPS (TLS 1.2+). The response size is capped at 1 MB.
+- `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` with `Authorization: Bearer <Claude Code access token>`, over HTTPS (TLS 1.2+). The response size is capped at 1 MB. The query requests banked-reset information. This block is gated on a Claude Code client header: the widget detects the installed version using `claude --version` (once per process, five-second timeout), includes that version and identifies itself as quota-burndown. If version detection fails or the response omits reset details, those details remain unknown. This remains an undocumented integration, not provider-approved access.
 - **Only if you turned on "Check for updates daily"** (off by default): `GET https://api.github.com/repos/mondrikrob/quota-burndown/releases/latest`, without credentials or usage data. After a successful check, it waits a day; after a failed check, it may retry once an hour. Only the release's version number is used. If it's newer, the widget shows a link to the release page. Nothing is downloaded or installed. The response size is capped at 512 KB.
 - For Codex, the script starts the official `codex app-server` and asks it for your rate limits. Any network traffic from that comes from the Codex CLI itself.
 
@@ -50,6 +50,7 @@ Everything goes to `%USERPROFILE%\.quota-burndown`, which inherits your user pro
 
 - `settings.json`
 - `claude-usage.json`: the last usage response, which contains no credentials
+- `banked-reset-notifications.json`: observed reset identifiers/counts and expiry-reminder history; no credentials
 - `update-check.json`: when the update check last ran and the latest version number (only if the update check is on)
 - `history.csv`
 - `widget.log`
@@ -67,6 +68,8 @@ Settings are validated when they're read, so a malformed `settings.json` falls b
 The shortcuts run `powershell.exe -ExecutionPolicy Bypass -File <script>`. This affects only that process, not your system policy. If your organisation requires signed scripts, sign `QuotaBurndown.ps1` with your own code-signing certificate and remove `-ExecutionPolicy Bypass` from the shortcuts.
 
 ## Processes it starts or stops
+
+- **Starts:** `claude.exe --version`, once per widget process with a five-second timeout, to obtain the installed client version for the banked-reset usage request. No prompt or login renewal is requested.
 
 - **Starts:** `claude.exe doctor`, found on `PATH` or in `~/.local/bin`, only when automatic login renewal is on and the login has expired (at most every 5 minutes for the first tries, then every 30 minutes). See [Automatic login renewal](#automatic-login-renewal-opt-in).
 - **Starts:** `codex.exe app-server --stdio`, found on `PATH`, in the Codex desktop app's folder, or in the npm global install. It runs without a shell from the widget's data folder, with a 30-second deadline and limits of 4 million stdout characters and 65,536 stderr characters. If it stalls or Codex can't reach its server, it is tried once more (20-second deadline). Both pipes are bounded while reading, including output without newlines. The Claude diagnostics helper bounds both pipes to 65,536 characters each.

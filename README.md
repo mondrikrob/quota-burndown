@@ -45,6 +45,8 @@ At 100% (sample data): <img src="docs/limit-reached-strip.png" height="52" alt="
 
 ## Features
 
+- **Banked resets.** Shows each provider's available reset count and next expiry in the widget and taskbar tooltip. Click the widget's reset line to open the provider's usage page. Windows notifications announce newly detected resets and warn once within the final 24 hours before expiry. Existing resets establish a baseline on first start; notification history prevents repeats after restarts. Toggle **Banked reset notifications** in the right-click menu. Missing reset information stays unknown, and stale/error readings do not generate alerts. Reminders arrive on the next successful refresh while the widget is running; Windows notification settings or Do Not Disturb may suppress them. Resets are applied manually on the provider's usage page.
+
 - **Desktop widget.** Compact by design: two lines per window, with the details on hover.
   - **Each window:** % used, how far over or under the even pace you are (e.g. "9% under"), and when it resets (e.g. "🕒 Sun 19:35 · 2d 3h", shown with a clock icon). Below that is a bar whose white tick marks where an even pace would put you.
   - **Run-out warning:** appears only when it matters, based on your recent burn rate (the last hour for the 5-hour window, today for the weekly one):
@@ -166,6 +168,7 @@ The hash must match exactly (`Get-FileHash` prints it in upper case; case doesn'
 - Start with Windows
 - Try Claude login renewal (experimental)
 - Check for updates daily
+- Banked reset notifications
 - Update available (only when there is one; opens the release page)
 - Open data folder
 - Exit
@@ -214,6 +217,7 @@ Stored in `%USERPROFILE%\.quota-burndown\settings.json`. Restart the widget afte
 | `CodexPlanUsdPerMonth` | auto | Overrides the detected plan price (Plus $20, Pro $200) |
 | `ClaudeAutoRenewLogin` | asked at install | Try `claude doctor` after login expiry; experimental, renewal not guaranteed; also in the menu |
 | `CheckForUpdates` | asked at install (off) | Look for a newer release once a day; also in the menu |
+| `BankedResetNotifications` | `true` | Notify about new banked resets and expiry within 24 hours; also in the menu |
 | `StartWithWindows` | asked at install (on) | Start the widget at sign-in (Startup folder shortcut); use the menu item to change it |
 | `Topmost`, `Visible`, `StripVisible` | `true` | Also available from the menu |
 | `StripOffset` | `8` | Gap between the strip and the tray icons; drag the strip to change it |
@@ -229,6 +233,7 @@ Everything lives in `%USERPROFILE%\.quota-burndown`. It's kept outside AppData o
 | `QuotaBurndown.ps1` | Installed copy of the script |
 | `settings.json` | Your settings |
 | `claude-usage.json` | Last Claude usage response, so restarts don't re-query the rate-limited endpoint |
+| `banked-reset-notifications.json` | Observed reset identifiers/counts and expiry reminder history; contains no credentials |
 | `update-check.json` | When the update check last ran and the latest version it saw (only if the check is on) |
 | `history.csv` | Every usage reading: `timestamp_utc, tool, window, used_percent, resets_at_utc` |
 | `widget.log` | Errors and warnings (rotated at 512 KB) |

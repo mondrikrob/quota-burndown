@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Show banked reset counts and the next expiry for Claude Code and Codex. Click the reset information to open the provider's usage page; it is also available in the taskbar tooltip.
+- Notify when new banked resets are detected and once within the final 24 hours before expiry. Save notification history across restarts, with a right-click menu toggle. Existing credits establish a baseline on first start; missing/stale/error readings do not produce alerts.
+- Request Claude reset grants through the existing usage endpoint, using the detected installed Claude Code version. Read Codex reset details from the existing App Server usage response. No reset is redeemed automatically.
+
 ## 1.7.0 (2026-10-12)
 
 - **Installer asks about autostart.** `-Install` (and `Install.cmd`) now asks "Start Quota Burndown when you sign in to Windows?", defaulting to yes. Before, autostart was only in the right-click menu, so a fresh install didn't come back after a restart. If **Start with Windows** is already ticked you aren't asked, and the answer is stored as `StartWithWindows` in `settings.json` so reinstalls don't ask again.
