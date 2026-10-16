@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.0 (2026-10-16)
 
 - Show banked reset counts and the next expiry for Claude Code and Codex. Click the reset information to open the provider's usage page; it is also available in the taskbar tooltip.
 - Notify when new banked resets are detected and once within the final 24 hours before expiry. Save notification history across restarts, with a right-click menu toggle. Existing credits establish a baseline on first start; missing/stale/error readings do not produce alerts.
