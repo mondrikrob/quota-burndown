@@ -496,6 +496,8 @@ Describe 'Model prices and token accounting' {
         (Get-ClaudePrice 'claude-opus-4-20250514')[1] | Should -Be 15
         (Get-ClaudePrice 'claude-opus-4-5')[1] | Should -Be 5
         (Get-ClaudePrice 'claude-sonnet-5-5')[5] | Should -Be 0.10
+        (Get-ClaudePrice 'claude-haiku-5-5')[1] | Should -Be 1.0
+        (Get-CodexPrice 'codex-auto-review')[1] | Should -Be 0
     }
     It 'prices Gemini models and subscription plans accurately' {
         (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[1] | Should -Be 2.00

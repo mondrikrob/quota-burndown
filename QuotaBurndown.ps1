@@ -1155,8 +1155,9 @@ namespace QuotaBurndown {
             @('claude-opus-4', 15, 75, 18.75, 30, 1.50),
             @('claude-sonnet-5-5', 2, 10, 2.5, 4, 0.10), @('claude-sonnet-5', 2, 10, 2.5, 4, 0.20),
             @('claude-sonnet-4-6', 3, 15, 3.75, 6, 0.30), @('claude-sonnet-4-5', 3, 15, 3.75, 6, 0.30),
-            @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30), @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10),
-            @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
+            @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30),
+            @('claude-haiku-5-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-5', 1, 5, 1.25, 2, 0.10),
+            @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
         )
         foreach ($row in $table) {
             if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{8}$')) { return , $row }
@@ -1166,7 +1167,10 @@ namespace QuotaBurndown {
 
     function Get-CodexPrice([string]$Model) {
         # model prefix, input, cached input, output
-        $table = @(@('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30))
+        $table = @(
+            @('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30),
+            @('codex-auto-review', 0, 0, 0)
+        )
         foreach ($row in $table) {
             if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{4}-\d{2}-\d{2}$')) { return , $row }
         }
