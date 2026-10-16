@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Desktop widget, taskbar strip and tray icon for Claude Code and Codex usage limits.
+    Desktop widget, taskbar strip and tray icon for Claude Code, Codex and Gemini usage limits.
 
 .DESCRIPTION
-    Shows the 5-hour and weekly rate-limit windows of Claude Code and OpenAI Codex,
-    where you would be at an even pace, a run-out forecast, the tokens you burned
-    (from local logs) and what those tokens would have cost at API prices.
+    Shows the 5-hour and weekly rate-limit windows of Claude Code, OpenAI Codex and
+    Google Gemini (Antigravity / Gemini CLI), where you would be at an even pace, a
+    run-out forecast, the tokens you burned (from local logs) and what those tokens
+    would have cost at API prices.
 
     Data sources
       Claude Code  GET https://api.anthropic.com/api/oauth/usage, authenticated with the
@@ -22,8 +23,13 @@
                    api.github.com. Nothing is downloaded.
       Codex        `codex app-server --stdio`, JSON-RPC method account/rateLimits/read,
                    falling back to the rate_limits blocks in ~/.codex/sessions/**/*.jsonl.
-      Tokens       Parsed locally from ~/.claude/projects/**/*.jsonl and
-                   ~/.codex/sessions/**/*.jsonl. Nothing is uploaded.
+      Gemini       Local Antigravity language server (GetUserStatus / RetrieveUserQuotaSummary
+                   on 127.0.0.1), with Gemini CLI OAuth fallback (~/.gemini/oauth_creds.json)
+                   and disk cache (~/.quota-burndown/gemini-usage.json).
+      Tokens       Parsed locally from ~/.claude/projects/**/*.jsonl,
+                   ~/.codex/sessions/**/*.jsonl and
+                   ~/.gemini/antigravity/brain/**/.system_generated/logs/transcript.jsonl.
+                   Nothing is uploaded.
 
     Runs on the Windows PowerShell 5.1 that ships with Windows (pwsh 7 works too).
     Settings, cache, usage history and log live in ~/.quota-burndown.
@@ -81,22 +87,24 @@ $SettingsPath = Join-Path $DataDir 'settings.json'
 # ===========================================================================
 
 $DefaultSettings = [ordered]@{
-    Left                  = $null
-    Top                   = $null
-    Topmost               = $true
-    Visible               = $true
-    StripVisible          = $true
-    StripOffset           = 8       # gap (DIP) between the taskbar strip and the tray area
-    StripAllTaskbars      = $false  # also show the strip on the other monitors' taskbars
-    ClaudeRefreshMinutes  = 5       # the Claude usage endpoint rate-limits; a 429 is honoured (Retry-After)
-    CodexRefreshMinutes   = 3
+    Left                     = $null
+    Top                      = $null
+    Topmost                  = $true
+    Visible                  = $true
+    StripVisible             = $true
+    StripOffset              = 8       # gap (DIP) between the taskbar strip and the tray area
+    StripAllTaskbars         = $false  # also show the strip on the other monitors' taskbars
+    ClaudeRefreshMinutes     = 5       # the Claude usage endpoint rate-limits; a 429 is honoured (Retry-After)
+    CodexRefreshMinutes      = 3
+    GeminiRefreshMinutes     = 3
     BankedResetNotifications = $true # new grants and one reminder within 24 hours of expiry
-    ClaudePlanUsdPerMonth = $null   # override the detected plan price (Pro 20, Max 100/200)
-    CodexPlanUsdPerMonth  = $null   # override the detected plan price (Plus 20, Pro 200)
-    ClaudeAutoRenewLogin  = $null   # experimental `claude doctor` renewal attempt; $null = not asked yet (off)
-    CheckForUpdates       = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
-    StartWithWindows      = $null   # Startup folder shortcut, asked at install; $null = not asked yet
-    SettingsVersion       = 2       # 2: ClaudeRefreshMinutes default lowered from 15 to 5
+    ClaudePlanUsdPerMonth    = $null   # override the detected plan price (Pro 20, Max 100/200)
+    CodexPlanUsdPerMonth     = $null   # override the detected plan price (Plus 20, Pro 200)
+    GeminiPlanUsdPerMonth    = $null   # override the detected plan price (Pro 20, Ultra 250)
+    ClaudeAutoRenewLogin     = $null   # experimental `claude doctor` renewal attempt; $null = not asked yet (off)
+    CheckForUpdates          = $null   # ask api.github.com once a day for a newer release; $null = not asked yet (off)
+    StartWithWindows         = $null   # Startup folder shortcut, asked at install; $null = not asked yet
+    SettingsVersion          = 2       # 2: ClaudeRefreshMinutes default lowered from 15 to 5
 }
 
 function ConvertTo-Number($Value, $Default, [double]$Min = [double]::MinValue, [double]$Max = [double]::MaxValue) {
@@ -127,8 +135,10 @@ function Read-Settings {
     $s.ClaudeRefreshMinutes = [int](ConvertTo-Number $s.ClaudeRefreshMinutes 5 5 1440)
     $s.SettingsVersion = $DefaultSettings.SettingsVersion
     $s.CodexRefreshMinutes = [int](ConvertTo-Number $s.CodexRefreshMinutes 3 1 1440)
+    $s.GeminiRefreshMinutes = [int](ConvertTo-Number $s.GeminiRefreshMinutes 3 1 1440)
     $s.ClaudePlanUsdPerMonth = ConvertTo-Number $s.ClaudePlanUsdPerMonth $null 0 100000
     $s.CodexPlanUsdPerMonth = ConvertTo-Number $s.CodexPlanUsdPerMonth $null 0 100000
+    $s.GeminiPlanUsdPerMonth = ConvertTo-Number $s.GeminiPlanUsdPerMonth $null 0 100000
     $s
 }
 
@@ -805,11 +815,333 @@ namespace QuotaBurndown {
         @{ Result = $r; NextAt = $now + [Math]::Min($interval, 120) }
     }
 
+    # ----- Gemini usage -----------------------------------------------------
+
+    function Get-GeminiDir { if ($env:GEMINI_CONFIG_DIR) { $env:GEMINI_CONFIG_DIR } else { Join-Path $HOME '.gemini' } }
+
+    function Read-GeminiCache {
+        $c = @{ fetchedAt = [long]0; plan = $null; planKey = $null; windows = @() }
+        $path = Get-DataFile 'gemini-usage.json'
+        if (Test-Path $path) {
+            try {
+                $j = Get-Content $path -Raw | ConvertFrom-Json
+                $c.fetchedAt = [long]$j.fetchedAt
+                $c.plan = if ($j.plan) { [string]$j.plan } else { $null }
+                $c.planKey = if ($j.planKey) { [string]$j.planKey } else { $null }
+                $wins = @()
+                foreach ($w in @($j.windows)) {
+                    if ($w -and $w.label -and $w.minutes) {
+                        $wins += New-UsageWindow ([string]$w.label) $w.percent ([int]$w.minutes) $w.resetsAt
+                    }
+                }
+                $c.windows = $wins
+            } catch { }
+        }
+        $c
+    }
+
+    function Write-GeminiCache($Result, [long]$FetchedAt) {
+        try {
+            $inv = [Globalization.CultureInfo]::InvariantCulture
+            $rows = foreach ($w in @($Result.Windows)) {
+                @{
+                    label    = $w.Label
+                    percent  = $w.Percent
+                    minutes  = $w.Minutes
+                    resetsAt = $(if ($w.ResetsAt) { $w.ResetsAt.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv) } else { $null })
+                }
+            }
+            ([pscustomobject]@{
+                fetchedAt = $FetchedAt
+                plan      = $Result.Plan
+                planKey   = $Result.PlanKey
+                windows   = @($rows)
+            }) | ConvertTo-Json -Depth 4 | Set-Content -Path (Get-DataFile 'gemini-usage.json') -Encoding UTF8
+        } catch { }
+    }
+
+    function ConvertFrom-GeminiPayload($StatusObj, $SummaryObj, [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow) {
+        $plan = $null; $planKey = $null
+        $us = if ($StatusObj -and $StatusObj.userStatus) { $StatusObj.userStatus } else { $StatusObj }
+        if (-not $SummaryObj -and $StatusObj -and $StatusObj.quotaSummary) { $SummaryObj = $StatusObj.quotaSummary }
+        if ($us) {
+            $tierDesc = if ($us.userTier -and $us.userTier.description) { [string]$us.userTier.description } else { '' }
+            $tierId = if ($us.userTier -and $us.userTier.id) { [string]$us.userTier.id } else { '' }
+            $planName = if ($us.planStatus -and $us.planStatus.planInfo -and $us.planStatus.planInfo.planName) { [string]$us.planStatus.planInfo.planName } else { '' }
+            if ($tierId -match 'ultra' -or $tierDesc -match 'Ultra' -or $planName -match 'Ultra') {
+                $planKey = 'ultra'; $plan = 'Ultra'
+            } elseif ($tierId -match 'pro' -or $tierDesc -match 'Pro' -or $planName -match '^Pro$') {
+                $planKey = 'pro'; $plan = 'Pro'
+            } elseif ($planName) {
+                $planKey = $planName.ToLowerInvariant(); $plan = Format-Title $planName
+            } elseif ($tierDesc) {
+                $planKey = $tierDesc.ToLowerInvariant(); $plan = $tierDesc
+            }
+        }
+
+        $candidates = @()
+        $sumRoot = if ($SummaryObj -and $SummaryObj.response) { $SummaryObj.response } else { $SummaryObj }
+        if ($sumRoot) {
+            $scopedBuckets = @()
+            foreach ($g in @($sumRoot.groups)) {
+                if (-not $g) { continue }
+                $gName = if ($g.displayName) { [string]$g.displayName } elseif ($g.groupName) { [string]$g.groupName } else { '' }
+                if ($gName -notmatch 'Gemini') { continue }
+                $scope = $null
+                if ($gName -notmatch '^Gemini Models$' -and $gName -match '^Gemini\s+(?:\d+(?:\.\d+)?\s+)?(.+)$') {
+                    $scope = $Matches[1].Trim()
+                }
+                foreach ($b in @($g.buckets)) {
+                    if ($b) { $scopedBuckets += [pscustomobject]@{ Bucket = $b; Scope = $scope } }
+                }
+            }
+            if ($scopedBuckets.Count -eq 0 -and $sumRoot.buckets) {
+                foreach ($b in @($sumRoot.buckets)) {
+                    if (-not $b) { continue }
+                    if ((-not $b.bucketId -and -not $b.modelId) -or $b.bucketId -match '^gemini' -or $b.modelId -match 'gemini') {
+                        $scope = if ([string]$b.bucketId -match 'argon' -or [string]$b.displayName -match 'Argon') { 'Argon' } else { $null }
+                        $scopedBuckets += [pscustomobject]@{ Bucket = $b; Scope = $scope }
+                    }
+                }
+            }
+            foreach ($entry in $scopedBuckets) {
+                $b = $entry.Bucket
+                $pct = $null
+                if ($null -ne $b.remainingFraction -and $b.remainingFraction -isnot [bool]) {
+                    $n = 0.0
+                    if (-not [double]::TryParse([string]$b.remainingFraction, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or [double]::IsNaN($n) -or [double]::IsInfinity($n) -or $n -lt 0 -or $n -gt 1) {
+                        throw 'Gemini usage response contains an invalid remaining fraction.'
+                    }
+                    $pct = (1.0 - $n) * 100.0
+                } elseif ($null -ne $b.remainingPercentage -and $b.remainingPercentage -isnot [bool]) {
+                    $n = 0.0
+                    if (-not [double]::TryParse([string]$b.remainingPercentage, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or [double]::IsNaN($n) -or [double]::IsInfinity($n) -or $n -lt 0 -or $n -gt 100) {
+                        throw 'Gemini usage response contains an invalid remaining percentage.'
+                    }
+                    $pct = 100.0 - $n
+                } elseif ($null -ne $b.usedPercent -and $b.usedPercent -isnot [bool]) {
+                    $pct = $b.usedPercent
+                }
+                if ($null -eq $pct) { continue }
+                $reset = ConvertTo-Dto $b.resetTime
+                $wKind = [string]$b.window
+                $bId = [string]$b.bucketId
+                $dName = [string]$b.displayName
+                $label = $null; $mins = 0
+                if ($wKind -eq '5h' -or $bId -match '5h' -or $dName -match 'Five Hour|5-hour') {
+                    $label = '5-hour'; $mins = 300
+                } elseif ($wKind -eq 'weekly' -or $bId -match 'weekly' -or $dName -match 'Weekly') {
+                    $label = 'Weekly'; $mins = 10080
+                } elseif ($wKind -eq 'daily' -or $bId -match '24h|daily' -or $dName -match 'Daily|24-hour') {
+                    $label = '24-hour'; $mins = 1440
+                } elseif ($reset -and $reset -gt $Now) {
+                    $rem = ($reset - $Now).TotalMinutes
+                    if ($rem -le 360) { $label = '5-hour'; $mins = 300 }
+                    elseif ($rem -le 1500) { $label = '24-hour'; $mins = 1440 }
+                    else { $label = 'Weekly'; $mins = 10080 }
+                }
+                if ($label -and $mins -gt 0) {
+                    if ($entry.Scope) { $label = $label + ' ' + [char]0x00B7 + ' ' + $entry.Scope }
+                    $validated = New-UsageWindow $label $pct $mins $reset
+                    $candidates += [pscustomobject]@{ Window = $validated; Scoped = [bool]$entry.Scope }
+                }
+            }
+        }
+
+        if ($candidates.Count -eq 0 -and $us -and $us.cascadeModelConfigData -and $us.cascadeModelConfigData.clientModelConfigs) {
+            foreach ($m in @($us.cascadeModelConfigData.clientModelConfigs)) {
+                if (-not $m -or -not $m.quotaInfo) { continue }
+                $mLabel = [string]$m.label
+                $mId = if ($m.modelOrAlias) { [string]$m.modelOrAlias.model } else { '' }
+                if ($mLabel -notmatch 'Gemini' -and $mId -notmatch 'GEMINI') { continue }
+                if ($null -eq $m.quotaInfo.remainingFraction -or $m.quotaInfo.remainingFraction -is [bool]) { continue }
+                $n = 0.0
+                if (-not [double]::TryParse([string]$m.quotaInfo.remainingFraction, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or [double]::IsNaN($n) -or [double]::IsInfinity($n) -or $n -lt 0 -or $n -gt 1) {
+                    throw 'Gemini usage response contains an invalid model remaining fraction.'
+                }
+                $pct = (1.0 - $n) * 100.0
+                $reset = ConvertTo-Dto $m.quotaInfo.resetTime
+                if (-not $reset) { continue }
+                $rem = ($reset - $Now).TotalMinutes
+                $label = if ($rem -le 360) { '5-hour' } else { 'Weekly' }
+                $mins = if ($rem -le 360) { 300 } else { 10080 }
+                $scoped = $false
+                if ($mins -eq 10080 -and $mLabel -match 'Argon') {
+                    $label = 'Weekly ' + [char]0x00B7 + ' Argon'
+                    $scoped = $true
+                }
+                $validated = New-UsageWindow $label $pct $mins $reset
+                $candidates += [pscustomobject]@{ Window = $validated; Scoped = $scoped }
+            }
+        }
+
+        $wins = @()
+        $grouped = $candidates |
+            Group-Object { $_.Window.Label } |
+            Sort-Object @{ Expression = { [int]$_.Group[0].Window.Minutes }; Ascending = $true }, @{ Expression = { [bool]$_.Group[0].Scoped }; Ascending = $true }, @{ Expression = { [string]$_.Name }; Ascending = $true }
+        foreach ($g in $grouped) {
+            $best = $g.Group | Sort-Object @{ Expression = { $_.Window.Percent }; Descending = $true } | Select-Object -First 1
+            $wins += $best.Window
+        }
+        if ($wins.Count -eq 0) { throw 'Gemini usage response contains no recognised windows.' }
+        [pscustomobject]@{ Plan = $plan; PlanKey = $planKey; Windows = $wins }
+    }
+
+    function Invoke-AntigravityRpc([int]$Port, [string]$Csrf, [string]$Method, [string]$PreferredScheme = '') {
+        $body = '{"metadata":{"ideName":"antigravity","extensionName":"antigravity","ideVersion":"unknown","locale":"en"}}'
+        $schemes = if ($PreferredScheme) { @($PreferredScheme) } else { @('http', 'https') }
+        foreach ($scheme in $schemes) {
+            $handler = [Net.Http.HttpClientHandler]::new()
+            $handler.AllowAutoRedirect = $false
+            if ($scheme -eq 'https') {
+                $handler.ServerCertificateCustomValidationCallback = {
+                    param($msg, $cert, $chain, $errs)
+                    [bool]($msg -and $msg.RequestUri -and $msg.RequestUri.IsLoopback)
+                }
+            }
+            $client = [Net.Http.HttpClient]::new($handler)
+            $client.Timeout = [TimeSpan]::FromSeconds(4)
+            $client.MaxResponseContentBufferSize = 2MB
+            $req = $null; $res = $null
+            try {
+                $uri = '{0}://127.0.0.1:{1}/exa.language_server_pb.LanguageServerService/{2}' -f $scheme, $Port, $Method
+                $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
+                $null = $req.Headers.TryAddWithoutValidation('Connect-Protocol-Version', '1')
+                $null = $req.Headers.TryAddWithoutValidation('x-codeium-csrf-token', $Csrf)
+                $req.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
+                $res = $client.SendAsync($req).GetAwaiter().GetResult()
+                if ([int]$res.StatusCode -eq 200) {
+                    $text = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    return [pscustomobject]@{ Scheme = $scheme; Payload = ($text | ConvertFrom-Json) }
+                }
+            } catch {
+            } finally {
+                if ($req) { $req.Dispose() }
+                if ($res) { $res.Dispose() }
+                $client.Dispose()
+            }
+        }
+        $null
+    }
+
+    function Get-GeminiLive {
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'language_server%'" -ErrorAction SilentlyContinue)
+        if ($procs.Count -eq 0) { throw 'Antigravity language server is not running' }
+        $lastErr = 'Antigravity language server port not found'
+        foreach ($p in $procs) {
+            $cmd = [string]$p.CommandLine
+            if ($cmd -notmatch '--csrf_token[=\s]+([^\s"]+)') { continue }
+            $csrf = $Matches[1]
+            if ($csrf.Length -gt 512 -or $csrf -notmatch '^[A-Za-z0-9._~+/-]+=*$') { continue }
+            $conns = @(Get-NetTCPConnection -OwningProcess $p.ProcessId -State Listen -ErrorAction SilentlyContinue)
+            $ports = @($conns | Select-Object -ExpandProperty LocalPort -Unique)
+            foreach ($port in $ports) {
+                $statusRes = Invoke-AntigravityRpc $port $csrf 'GetUserStatus'
+                $scheme = if ($statusRes) { $statusRes.Scheme } else { '' }
+                $summaryRes = Invoke-AntigravityRpc $port $csrf 'RetrieveUserQuotaSummary' $scheme
+                $statusObj = if ($statusRes) { $statusRes.Payload } else { $null }
+                $summaryObj = if ($summaryRes) { $summaryRes.Payload } else { $null }
+                if ($statusObj -or $summaryObj) {
+                    try { return (ConvertFrom-GeminiPayload $statusObj $summaryObj) }
+                    catch { $lastErr = $_.Exception.Message }
+                }
+            }
+        }
+        throw $lastErr
+    }
+
+    function Get-GeminiCliQuota([long]$Now) {
+        $credPath = Join-Path (Get-GeminiDir) 'oauth_creds.json'
+        if (-not (Test-Path $credPath)) { return $null }
+        try { $creds = Get-Content $credPath -Raw | ConvertFrom-Json } catch { return $null }
+        $token = [string]$creds.access_token
+        if (-not $token -or $token.Length -gt 8192 -or $token -notmatch '^[A-Za-z0-9._~+/-]+=*$') { return $null }
+        if ($creds.expiry_date -and [long]$creds.expiry_date -lt $Now * 1000) { return $null }
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(10)
+        $client.MaxResponseContentBufferSize = 1MB
+        $req = $null; $res = $null
+        try {
+            $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, 'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary')
+            $req.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
+            $req.Content = [Net.Http.StringContent]::new('{}', [Text.Encoding]::UTF8, 'application/json')
+            $res = $client.SendAsync($req).GetAwaiter().GetResult()
+            if ([int]$res.StatusCode -eq 200) {
+                $text = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                return (ConvertFrom-GeminiPayload $null ($text | ConvertFrom-Json))
+            }
+        } catch {
+        } finally {
+            if ($req) { $req.Dispose() }
+            if ($res) { $res.Dispose() }
+            $client.Dispose()
+        }
+        $null
+    }
+
+    function Test-GeminiInstalled {
+        $agyApp = Join-Path $env:LOCALAPPDATA 'Programs\antigravity'
+        $agyDir = Join-Path (Get-GeminiDir) 'antigravity'
+        $credPath = Join-Path (Get-GeminiDir) 'oauth_creds.json'
+        (Test-Path $agyApp) -or (Test-Path $agyDir) -or (Test-Path $credPath)
+    }
+
+    function Update-Gemini([int]$IntervalMin) {
+        $now = Get-UnixNow
+        $interval = [Math]::Max(1, $IntervalMin) * 60
+        $r = New-UsageResult 'Gemini'
+        $liveError = $null
+        try {
+            $live = Get-GeminiLive
+            $r.Windows = $live.Windows
+            $r.Plan = $live.Plan
+            $r.PlanKey = $live.PlanKey
+            $r.UpdatedAt = [DateTimeOffset]::UtcNow
+            $r.Source = 'live'
+            Write-GeminiCache $r $now
+            return @{ Result = $r; NextAt = $now + $interval }
+        } catch {
+            $liveError = $_.Exception.Message
+        }
+
+        $cli = $null
+        try { $cli = Get-GeminiCliQuota $now } catch { }
+        if ($cli) {
+            $r.Windows = $cli.Windows
+            $r.Plan = $cli.Plan
+            $r.PlanKey = $cli.PlanKey
+            $r.UpdatedAt = [DateTimeOffset]::UtcNow
+            $r.Source = 'api'
+            Write-GeminiCache $r $now
+            return @{ Result = $r; NextAt = $now + $interval }
+        }
+
+        $cache = Read-GeminiCache
+        $nowDto = [DateTimeOffset]::UtcNow
+        $validWins = @($cache.windows | Where-Object { $_.ResetsAt -and $_.ResetsAt -gt $nowDto })
+        if ($validWins.Count -gt 0 -and $cache.fetchedAt -gt 0) {
+            $r.Windows = $validWins
+            $r.Plan = $cache.plan
+            $r.PlanKey = $cache.planKey
+            $r.UpdatedAt = [DateTimeOffset]::FromUnixTimeSeconds($cache.fetchedAt)
+            $r.Source = 'logs'
+            $r.Detail = "Live query unavailable ($liveError); showing the last cached Gemini reading."
+            return @{ Result = $r; NextAt = $now + [Math]::Min($interval, 120) }
+        }
+
+        $r.Error = if (Test-GeminiInstalled) { 'unavailable' } else { 'not found' }
+        $r.Detail = $liveError
+        @{ Result = $r; NextAt = $now + [Math]::Min($interval, 120) }
+    }
+
     # ----- prices -----------------------------------------------------------
-    # API list prices in USD per million tokens (checked 2026-10-11). Used only to
+    # API list prices in USD per million tokens (checked 2026-10-16). Used only to
     # estimate what your usage would have cost on the pay-as-you-go API.
     # Sources: https://platform.claude.com/docs/en/about-claude/pricing
     #          https://developers.openai.com/api/docs/pricing
+    #          https://ai.google.dev/gemini-api/docs/pricing
 
     function Get-ClaudePrice([string]$Model) {
         # model prefix, input, output, 5-minute cache write, 1-hour cache write, cache read
@@ -841,15 +1173,38 @@ namespace QuotaBurndown {
         $null
     }
 
+    function Get-GeminiPrice([string]$Model) {
+        if (-not $Model) { return $null }
+        $norm = (($Model.ToLowerInvariant() -replace '\s*\((high|medium|low|max)\)\s*$', '') -replace '[\s_]+', '-').Trim('-')
+        $norm = $norm -replace '-(high|medium|low|max|preview|exp|latest|windsurf)$', ''
+        # model prefix, input, cached input, output
+        $table = @(
+            @('gemini-4-argon', 2.0, 0.10, 10.0), @('gemini-4-pro', 2.0, 0.10, 10.0),
+            @('gemini-3.8-flash', 0.75, 0.075, 3.75), @('gemini-3.7-flash', 0.75, 0.075, 3.75), @('gemini-3.6-flash', 0.75, 0.075, 3.75),
+            @('gemini-3.5-flash-lite', 0.30, 0.03, 2.50), @('gemini-3.5-flash', 1.50, 0.15, 9.0),
+            @('gemini-3.1-pro', 2.0, 0.20, 12.0), @('gemini-3-pro', 2.0, 0.20, 12.0),
+            @('gemini-3.1-flash-lite', 0.25, 0.025, 1.50), @('gemini-3-flash', 0.50, 0.05, 3.0),
+            @('gemini-2.5-pro', 1.25, 0.125, 10.0), @('gemini-2.5-flash-lite', 0.10, 0.01, 0.40), @('gemini-2.5-flash', 0.30, 0.03, 2.50)
+        )
+        foreach ($row in $table) {
+            if ($norm -eq $row[0] -or $norm -match ('^' + [regex]::Escape($row[0]) + '-\d{2,4}(-\d{2})?(-\d{2})?$')) { return , $row }
+        }
+        $null
+    }
+
     function Get-PlanUsdPerMonth([string]$Tool, [string]$PlanKey) {
-        $prices = if ($Tool -eq 'Claude Code') { @{ pro = 20; max5x = 100; max20x = 200; max = 100 } } else { @{ plus = 20; pro = 200 } }
+        $prices = switch ($Tool) {
+            'Claude Code' { @{ pro = 20; max5x = 100; max20x = 200; max = 100 } }
+            'Gemini'      { @{ pro = 20; ultra = 250 } }
+            default       { @{ plus = 20; pro = 200 } }
+        }
         if ($PlanKey -and $prices.ContainsKey($PlanKey)) { return [double]$prices[$PlanKey] }
         $null
     }
 
     # ----- burned tokens (local logs) ---------------------------------------
-    # Counted from the logs Claude Code and Codex write on this PC, so usage from
-    # claude.ai, ChatGPT on the web or other devices is not included. Files are
+    # Counted from the logs Claude Code, Codex and Gemini/Antigravity write on this
+    # PC, so usage from web/mobile apps or other devices is not included. Files are
     # read incrementally: each pass parses only the lines appended since the last.
 
     function New-TokenState { @{ Files = @{}; List = @(); ListedAt = [DateTime]::MinValue } }
@@ -1008,6 +1363,85 @@ namespace QuotaBurndown {
         $s
     }
 
+    function Update-GeminiTokens($State) {
+        $root = Join-Path (Get-GeminiDir) 'antigravity\brain'
+        if (-not (Test-Path $root)) { return }
+        $cut = [DateTimeOffset]::UtcNow.AddDays(-8)
+        if (([DateTime]::UtcNow - $State.ListedAt).TotalMinutes -ge 5) {
+            $State.List = @(Get-ChildItem $root -Recurse -Filter 'transcript.jsonl' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTimeUtc -gt $cut.UtcDateTime } | ForEach-Object { $_.FullName })
+            $State.ListedAt = [DateTime]::UtcNow
+            foreach ($k in @($State.Files.Keys)) { if ($State.List -notcontains $k) { $State.Files.Remove($k) } }
+        }
+        foreach ($path in $State.List) {
+            try { $lines = Read-NewLines $State.Files $path } catch { continue }
+            $st = $State.Files[$path]
+            $entries = $st.Entries
+            foreach ($l in $lines) {
+                if ($l.Contains('"type":"USER_INPUT"') -and $l.Contains('Model Selection')) {
+                    $m = [regex]::Match($l, 'changed setting `Model Selection` from [^\r\n\\]+? to ([^\r\n\\<]+?)\. No need to comment')
+                    if ($m.Success) { $st.Model = $m.Groups[1].Value.Trim() }
+                    continue
+                }
+                if (-not $l.Contains('"type":"PLANNER_RESPONSE"')) { continue }
+                if ($st.Model -and $st.Model -match '^(Claude|GPT)\b') { continue }
+                $ts = [regex]::Match($l, '"created_at":"([^"]+)"')
+                if (-not $ts.Success) { continue }
+                try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+                $inTok = Get-UsageField $l 'input_tokens'
+                $cacheRead = Get-UsageField $l 'cache_read_tokens'
+                $outTok = Get-UsageField $l 'output_tokens'
+                if (($inTok + $cacheRead + $outTok) -le 0) { continue }
+                $step = [regex]::Match($l, '"step_index":(\d+)')
+                $modelName = if ($st.Model) { $st.Model } else { 'Gemini 4 Argon' }
+                $e = [pscustomobject]@{
+                    Id        = $(if ($step.Success) { $path + '#' + $step.Groups[1].Value } else { $null })
+                    At        = $at
+                    Model     = $modelName
+                    Input     = $inTok
+                    CacheRead = $cacheRead
+                    Output    = $outTok
+                    Cost      = [double]0
+                    Unpriced  = [long]0
+                }
+                $p = Get-GeminiPrice $modelName
+                if ($p) { $e.Cost = ($e.Input * $p[1] + $e.CacheRead * $p[2] + $e.Output * $p[3]) / 1e6 }
+                else { $e.Unpriced = $e.Input + $e.CacheRead + $e.Output }
+                $null = $entries.Add($e)
+            }
+            if ($entries.Count -and $entries[0].At -lt $cut) {
+                $keep = @($entries | Where-Object { $_.At -ge $cut })
+                $entries.Clear(); foreach ($e in $keep) { $null = $entries.Add($e) }
+            }
+        }
+    }
+
+    function Measure-GeminiTokens($State, [DateTimeOffset]$Since, [string]$ModelFilter = '') {
+        $byId = @{}; $anon = New-Object System.Collections.ArrayList
+        foreach ($st in $State.Files.Values) {
+            foreach ($e in $st.Entries) {
+                if ($e.At -lt $Since) { continue }
+                if ($ModelFilter) {
+                    if ($ModelFilter.StartsWith('!')) {
+                        $neg = $ModelFilter.Substring(1)
+                        if (([string]$e.Model) -match [regex]::Escape($neg)) { continue }
+                    } else {
+                        if (([string]$e.Model) -notmatch [regex]::Escape($ModelFilter)) { continue }
+                    }
+                }
+                if (-not $e.Id) { $null = $anon.Add($e); continue }
+                $prev = $byId[$e.Id]
+                if (-not $prev -or ($e.Input + $e.Output + $e.CacheRead) -gt ($prev.Input + $prev.Output + $prev.CacheRead)) { $byId[$e.Id] = $e }
+            }
+        }
+        $s = New-TokenSum
+        foreach ($e in @($byId.Values) + @($anon)) {
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+        }
+        $s.Total = $s.Input + $s.Output + $s.CacheRead
+        $s
+    }
+
     # Token sums per usage window, keyed by window label ('5-hour', 'Weekly', ...).
     function Get-WindowTokens($Result, $State, [string]$Kind) {
         $now = [DateTimeOffset]::UtcNow
@@ -1017,12 +1451,27 @@ namespace QuotaBurndown {
                 [pscustomobject]@{ Label = 'Weekly'; Minutes = 10080; ResetsAt = $null })
         }
         $out = @{}
+        $hasArgonScoped = [bool]($wins | Where-Object { $_.Label -eq ('Weekly ' + [char]0x00B7 + ' Argon') })
         foreach ($w in $wins) {
             # A scoped Claude quota does not represent all locally logged models.
             # Omit its token total until we can attribute entries to that scope.
             if ($Kind -eq 'claude' -and $w.Label -like 'Weekly *') { continue }
             $since = if ($w.ResetsAt -and $w.ResetsAt -gt $now) { $w.ResetsAt.AddMinutes(-$w.Minutes) } else { $now.AddMinutes(-$w.Minutes) }
-            $out[$w.Label] = if ($Kind -eq 'claude') { Measure-ClaudeTokens $State $since } else { Measure-CodexTokens $State $since }
+            $filter = ''
+            if ($Kind -eq 'gemini') {
+                if ($w.Label -match ([char]0x00B7 + '\s*(.+)$')) { $filter = $Matches[1].Trim() }
+                elseif ($w.Label -eq 'Weekly' -and $hasArgonScoped) { $filter = '!Argon' }
+            }
+            $out[$w.Label] = switch ($Kind) {
+                'claude' { Measure-ClaudeTokens $State $since }
+                'gemini' { Measure-GeminiTokens $State $since $filter }
+                default  { Measure-CodexTokens $State $since }
+            }
+        }
+        if ($Kind -eq 'gemini' -and $hasArgonScoped) {
+            $weeklyWindow = $wins | Where-Object { $_.Label -eq 'Weekly' -or $_.Minutes -eq 10080 } | Select-Object -First 1
+            $wSince = if ($weeklyWindow -and $weeklyWindow.ResetsAt -and $weeklyWindow.ResetsAt -gt $now) { $weeklyWindow.ResetsAt.AddMinutes(-$weeklyWindow.Minutes) } else { $now.AddMinutes(-10080) }
+            $out['WeeklyAll'] = Measure-GeminiTokens $State $wSince ''
         }
         $out
     }
@@ -1214,7 +1663,11 @@ namespace QuotaBurndown {
 $Settings = Read-Settings
 
 function Get-PlanPrice($Result) {
-    $override = if ($Result.Name -eq 'Claude Code') { $Settings.ClaudePlanUsdPerMonth } else { $Settings.CodexPlanUsdPerMonth }
+    $override = switch ($Result.Name) {
+        'Claude Code' { $Settings.ClaudePlanUsdPerMonth }
+        'Gemini'      { $Settings.GeminiPlanUsdPerMonth }
+        default       { $Settings.CodexPlanUsdPerMonth }
+    }
     if ($null -ne $override) { return [double]$override }
     Get-PlanUsdPerMonth $Result.Name $Result.PlanKey
 }
@@ -1287,10 +1740,18 @@ function Save-LogoIcon([string]$Path) {
 
 if ($Once) {
     $history = Import-UsageHistory
-    foreach ($kind in 'claude', 'codex') {
-        $r = if ($kind -eq 'claude') { (Update-Claude $Settings.ClaudeRefreshMinutes $false ([bool]$Settings.ClaudeAutoRenewLogin)).Result } else { (Update-Codex $Settings.CodexRefreshMinutes).Result }
+    foreach ($kind in 'claude', 'codex', 'gemini') {
+        $r = switch ($kind) {
+            'claude' { (Update-Claude $Settings.ClaudeRefreshMinutes $false ([bool]$Settings.ClaudeAutoRenewLogin)).Result }
+            'gemini' { (Update-Gemini $Settings.GeminiRefreshMinutes).Result }
+            default  { (Update-Codex $Settings.CodexRefreshMinutes).Result }
+        }
         $st = New-TokenState
-        if ($kind -eq 'claude') { Update-ClaudeTokens $st } else { Update-CodexTokens $st }
+        switch ($kind) {
+            'claude' { Update-ClaudeTokens $st }
+            'gemini' { Update-GeminiTokens $st }
+            default  { Update-CodexTokens $st }
+        }
         $tokens = Get-WindowTokens $r $st $kind
         $forecasts = Get-Forecasts $history $r
         $hdr = $r.Name + $(if ($r.Plan) { " ($($r.Plan))" }) + $(if ($r.Source) { " [$($r.Source)]" }) + $(if ($r.Error) { " ERROR: $($r.Error)" })
@@ -1298,8 +1759,11 @@ if ($Once) {
         if ($r.Detail) { Write-Output "  $($r.Detail)" }
         foreach ($w in $r.Windows) {
             $t = $tokens[$w.Label]; $f = $forecasts[$w.Label]
-            $line = '  {0,-16} {1,5:0}%  resets {2:ddd HH:mm}  tokens {3,7}  ~{4} API' -f $w.Label, $w.Percent, $w.ResetsAt.LocalDateTime, (Format-Tokens $t.Total), (Format-Usd $t.Cost)
-            if ($t.Unpriced -gt 0) { $line += ' (priced subtotal; ' + (Format-Tokens $t.Unpriced) + ' tokens unpriced)' }
+            $line = '  {0,-16} {1,5:0}%  resets {2:ddd HH:mm}' -f $w.Label, $w.Percent, $w.ResetsAt.LocalDateTime
+            if ($t) {
+                $line += '  tokens {0,7}  ~{1} API' -f (Format-Tokens $t.Total), (Format-Usd $t.Cost)
+                if ($t.Unpriced -gt 0) { $line += ' (priced subtotal; ' + (Format-Tokens $t.Unpriced) + ' tokens unpriced)' }
+            }
             if ($w.Percent -ge 100 -and $w.ResetsAt -gt [DateTimeOffset]::UtcNow) { $line += '  LIMIT REACHED' }
             elseif ($f -and $f.Level -eq 'alert') { $line += '  RUNS OUT ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
             elseif ($f -and $f.Level -eq 'tight') { $line += '  tight: out ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
@@ -1328,7 +1792,7 @@ function New-LaunchShortcut([string]$Path, [string]$Script = $PSCommandPath) {
     $ico = Join-Path $DataDir 'quota-burndown.ico'
     try { Save-LogoIcon $ico } catch { }
     $lnk.IconLocation = if (Test-Path $ico) { $ico + ',0' } else { (Join-Path $env:WINDIR 'System32\imageres.dll') + ',-1024' }
-    $lnk.Description = 'Quota Burndown - Claude Code and Codex usage limits'
+    $lnk.Description = 'Quota Burndown - Claude Code, Codex and Gemini usage limits'
     $lnk.Save()
 }
 
@@ -1450,24 +1914,25 @@ if (-not ('QuotaBurndown.Native' -as [type])) {
 # ----- background worker ---------------------------------------------------
 
 $sync = [hashtable]::Synchronized(@{
-        Claude = $null; Codex = $null; Tokens = @{}; Forecast = @{}
+        Claude = $null; Codex = $null; Gemini = $null; Tokens = @{}; Forecast = @{}
         Version = 0; RefreshRequested = $false; Stop = $false
-        ClaudeInterval = $Settings.ClaudeRefreshMinutes; CodexInterval = $Settings.CodexRefreshMinutes
+        ClaudeInterval = $Settings.ClaudeRefreshMinutes; CodexInterval = $Settings.CodexRefreshMinutes; GeminiInterval = $Settings.GeminiRefreshMinutes
         AutoRenew = [bool]$Settings.ClaudeAutoRenewLogin; CheckUpdates = [bool]$Settings.CheckForUpdates; Update = $null; AppVersion = $AppVersion
     })
 $sync.Claude = New-UsageResult 'Claude Code'; $sync.Claude.Loading = $true
 $sync.Codex = New-UsageResult 'Codex'; $sync.Codex.Loading = $true
+$sync.Gemini = New-UsageResult 'Gemini'; $sync.Gemini.Loading = $true
 
 $WorkerLoop = {
     $ErrorActionPreference = 'Stop'
     Set-Variable -Name AppVersion -Value $sync.AppVersion -Scope Script   # read by the data layer
-    $claudeNext = 0; $codexNext = 0; $derivedNext = 0; $updateNext = 0; $lastClaudeLog = $null
-    $tokClaude = New-TokenState; $tokCodex = New-TokenState
+    $claudeNext = 0; $codexNext = 0; $geminiNext = 0; $derivedNext = 0; $updateNext = 0; $lastClaudeLog = $null
+    $tokClaude = New-TokenState; $tokCodex = New-TokenState; $tokGemini = New-TokenState
     $history = Import-UsageHistory; $last = @{}
     foreach ($s in $history) { $last[$s.Tool + '|' + $s.Label] = $s }
     while (-not $sync.Stop) {
         $manual = $false
-        if ($sync.RefreshRequested) { $sync.RefreshRequested = $false; $manual = $true; $claudeNext = 0; $codexNext = 0 }
+        if ($sync.RefreshRequested) { $sync.RefreshRequested = $false; $manual = $true; $claudeNext = 0; $codexNext = 0; $geminiNext = 0 }
         $now = Get-UnixNow
         if ($now -ge $claudeNext) {
             try {
@@ -1498,17 +1963,44 @@ $WorkerLoop = {
             } catch { Write-WidgetLog "Codex worker: $_"; $codexNext = $now + 120 }
             $derivedNext = 0; $sync.Version++
         }
+        if ($now -ge $geminiNext) {
+            try {
+                $u = Update-Gemini $sync.GeminiInterval
+                $prev = $sync.Gemini
+                if ($u.Result.Source -notin 'live', 'api' -and $prev -and $prev.Source -in 'live', 'api' -and ([DateTimeOffset]::UtcNow - $prev.UpdatedAt).TotalMinutes -lt 20) {
+                    $retained = $prev.PSObject.Copy()
+                    $retained.Error = 'stale'
+                    $retained.Detail = 'Live refresh failed; keeping the previous live reading. ' + $u.Result.Detail
+                    $sync.Gemini = $retained
+                    $geminiNext = $now + 60
+                } else {
+                    $sync.Gemini = $u.Result; $geminiNext = $u.NextAt
+                    Add-UsageSample $history $last $u.Result
+                }
+                if ($u.Result.Detail) { Write-WidgetLog ('Gemini: {0}' -f $u.Result.Detail) }
+            } catch { Write-WidgetLog "Gemini worker: $_"; $geminiNext = $now + 120 }
+            $derivedNext = 0; $sync.Version++
+        }
         if ($now -ge $derivedNext) {
             # Tokens, value and forecasts: recomputed after every reading and once a minute.
             try {
                 Update-ClaudeTokens $tokClaude
                 Update-CodexTokens $tokCodex
-                $sync.Tokens = @{ 'Claude Code' = (Get-WindowTokens $sync.Claude $tokClaude 'claude'); 'Codex' = (Get-WindowTokens $sync.Codex $tokCodex 'codex') }
+                Update-GeminiTokens $tokGemini
+                $sync.Tokens = @{
+                    'Claude Code' = (Get-WindowTokens $sync.Claude $tokClaude 'claude')
+                    'Codex'       = (Get-WindowTokens $sync.Codex $tokCodex 'codex')
+                    'Gemini'      = (Get-WindowTokens $sync.Gemini $tokGemini 'gemini')
+                }
                 $cut = [DateTimeOffset]::UtcNow.AddDays(-8)
                 if ($history.Count -and $history[0].At -lt $cut) {
                     $keep = @($history | Where-Object { $_.At -ge $cut }); $history.Clear(); foreach ($s in $keep) { $null = $history.Add($s) }
                 }
-                $sync.Forecast = @{ 'Claude Code' = (Get-Forecasts $history $sync.Claude); 'Codex' = (Get-Forecasts $history $sync.Codex) }
+                $sync.Forecast = @{
+                    'Claude Code' = (Get-Forecasts $history $sync.Claude)
+                    'Codex'       = (Get-Forecasts $history $sync.Codex)
+                    'Gemini'      = (Get-Forecasts $history $sync.Gemini)
+                }
             } catch { Write-WidgetLog "Derived values: $_" }
             $derivedNext = $now + 60
             $sync.Version++
@@ -1543,9 +2035,9 @@ else {
     try { $lightTaskbar = (Get-ItemPropertyValue $PersonalizeKey 'SystemUsesLightTheme') -eq 1 } catch { }
 }
 $Light = @{ Card = '#F5F9F9F9'; Border = '#1F000000'; Text = '#1B1B1B'; Muted = '#5E6369'; Track = '#1A000000'; Tick = '#8C000000'
-    Hover = '#14000000'; Ok = '#1A7F37'; Warn = '#9A6700'; Bad = '#CF222E'; Claude = '#C15F3C'; Codex = '#1B1B1B' }
+    Hover = '#14000000'; Ok = '#1A7F37'; Warn = '#9A6700'; Bad = '#CF222E'; Claude = '#C15F3C'; Codex = '#1B1B1B'; Gemini = '#1A73E8' }
 $Dark = @{ Card = '#EB1E1F22'; Border = '#26FFFFFF'; Text = '#F0F0F0'; Muted = '#9AA0A6'; Track = '#33FFFFFF'; Tick = '#B3FFFFFF'
-    Hover = '#1FFFFFFF'; Ok = '#3FB950'; Warn = '#D29922'; Bad = '#F85149'; Claude = '#E08A6D'; Codex = '#F0F0F0' }
+    Hover = '#1FFFFFFF'; Ok = '#3FB950'; Warn = '#D29922'; Bad = '#F85149'; Claude = '#E08A6D'; Codex = '#F0F0F0'; Gemini = '#58A6FF' }
 $T = if ($lightTheme) { $Light } else { $Dark }
 $B = @{}; foreach ($k in $T.Keys) { $B[$k] = New-Brush $T[$k] }
 $TT = if ($lightTaskbar) { $Light } else { $Dark }    # the strip follows the taskbar's own theme
@@ -1802,7 +2294,8 @@ function Add-ProviderSection($r, [bool]$First) {
     [Windows.Controls.DockPanel]::SetDock($status, 'Right')
     $null = $header.Children.Add($status)
     $title = [Windows.Controls.TextBlock]::new()
-    Add-Run $title $r.Name $(if ($r.Name -eq 'Claude Code') { $B.Claude } else { $B.Codex }) 13 ([Windows.FontWeights]::SemiBold)
+    $titleBrush = switch ($r.Name) { 'Claude Code' { $B.Claude } 'Gemini' { $B.Gemini } default { $B.Codex } }
+    Add-Run $title $r.Name $titleBrush 13 ([Windows.FontWeights]::SemiBold)
     if ($r.Plan) { Add-Run $title ('  ' + $r.Plan) $B.Muted 11 $null }
     $null = $header.Children.Add($title)
     $null = $root.Children.Add($header)
@@ -1827,7 +2320,8 @@ function Add-ProviderSection($r, [bool]$First) {
     foreach ($w in @($r.Windows)) { Add-WindowRow $r $w $now }
 
     # One summary line: this week's tokens and what they'd cost on the API.
-    $week = Get-Derived 'Tokens' $r.Name 'Weekly'
+    $week = Get-Derived 'Tokens' $r.Name 'WeeklyAll'
+    if (-not $week) { $week = Get-Derived 'Tokens' $r.Name 'Weekly' }
     if ($week -and $week.Total -gt 0) {
         $plan = Get-PlanPrice $r
         $v = [Windows.Controls.TextBlock]::new()
@@ -1847,11 +2341,15 @@ function Add-ProviderSection($r, [bool]$First) {
             Add-Run $v ('{0:0.0}{1} plan' -f $ratio, $Sym.Times) $B[$(if ($ratio -ge 1) { 'Ok' } else { 'Muted' })] 11 $null
             $tip += 'Your plan: {0}/month = {1}/week, so this is {2:0.0}{3} its price.' -f (Format-Usd $plan), (Format-Usd $weekly), $ratio, $Sym.Times
         } elseif (-not $plan) {
-            $tip += 'Set {0}PlanUsdPerMonth in settings.json to compare with your plan.' -f $(if ($r.Name -eq 'Claude Code') { 'Claude' } else { 'Codex' })
+            $settingPrefix = switch ($r.Name) { 'Claude Code' { 'Claude' } 'Gemini' { 'Gemini' } default { 'Codex' } }
+            $tip += 'Set {0}PlanUsdPerMonth in settings.json to compare with your plan.' -f $settingPrefix
         }
         if ($week.Unpriced -gt 0) { $tip += (Format-Tokens $week.Unpriced) + ' tokens have no known model price. The plan comparison is hidden until all tokens are priced.' }
-        $tip += $(if ($r.Name -eq 'Claude Code') { "The % limits also count claude.ai chats and other devices; these tokens don't." }
-                  else { "The % limits also count Codex in ChatGPT on the web and other devices; these tokens don't, so the real value is higher." })
+        $tip += switch ($r.Name) {
+            'Claude Code' { "The % limits also count claude.ai chats and other devices; these tokens don't." }
+            'Gemini'      { "The % limits are shared across Antigravity and Gemini CLI on your account; these tokens only count local Antigravity transcripts on this PC." }
+            default       { "The % limits also count Codex in ChatGPT on the web and other devices; these tokens don't, so the real value is higher." }
+        }
         $v.ToolTip = $tip -join "`n"
         $null = $root.Children.Add($v)
     }
@@ -1941,13 +2439,13 @@ function Update-Strip {
     foreach ($s in $script:strips) { $s.Rows.Children.Clear() }
     $tips = @()
     $first = $true
-    foreach ($r in @($sync.Claude, $sync.Codex)) {
+    foreach ($r in @($sync.Claude, $sync.Codex, $sync.Gemini)) {
         if (-not $r) { continue }
         $wins = @($r.Windows)
         $uncertain = [bool]$r.Error -or $r.Source -eq 'logs' -or (-not $r.UpdatedAt) -or (($now - $r.UpdatedAt).TotalMinutes -gt 15)
-        $tone = if ($r.Name -eq 'Claude Code') { $SB.Claude } else { $SB.Text }
+        $tone = switch ($r.Name) { 'Claude Code' { $SB.Claude } 'Gemini' { $SB.Gemini } default { $SB.Text } }
         if ($uncertain) { $tone = $SB.Warn }
-        $specs = @(@('5h', ($wins | Where-Object { $_.Minutes -eq 300 } | Select-Object -First 1)), @('7d', ($wins | Where-Object { $_.Label -eq 'Weekly' } | Select-Object -First 1)))
+        $specs = @(@('5h', ($wins | Where-Object { $_.Minutes -eq 300 } | Select-Object -First 1)), @('7d', ($wins | Where-Object { $_.Label -eq 'Weekly' -or $_.Minutes -eq 10080 } | Select-Object -First 1)))
         foreach ($s in $script:strips) {
             # WPF elements can have only one parent: every strip gets its own bars.
             $pair = [Windows.Controls.StackPanel]::new(); $pair.Orientation = 'Horizontal'; $pair.VerticalAlignment = 'Center'
@@ -1978,14 +2476,32 @@ function Update-Strip {
         }
         if ($r.Loading) { $tips += '    loading' + $Sym.Ellipsis } elseif ($r.Error) { $tips += "    $($r.Error)" }
         if ($r.UpdatedAt) { $tips += '    Last reading: {0:ddd HH:mm} ({1} ago)' -f $r.UpdatedAt.LocalDateTime, (Format-Span ($now - $r.UpdatedAt)) }
-        if ($r.Source -eq 'logs') { $tips += '    Source: local session logs; this may be an older account snapshot.' }
+        if ($r.Source -eq 'logs') { $tips += '    Source: local cache/logs; this may be an older account snapshot.' }
         if ($r.Detail) { $tips += '    ' + $r.Detail }
     }
     $tips += ''
-    $tips += '5h = 5-hour window, 7d = weekly. Orange labels = Claude Code, white = Codex.'
-    $tips += 'Red = used, grey = remaining, white line = even pace. White x on a full red bar = LIMIT REACHED (100%). Red label = forecast warning; amber outline = tight. ? = unknown or stale.'
+    $tips += '5h = 5-hour, 7d = weekly. Orange = Claude, white = Codex, blue = Gemini.'
+    $tips += 'Red = used, grey = remaining, white line = even pace.'
+    $tips += 'White x on full red bar = LIMIT REACHED (100%).'
+    $tips += 'Red label = forecast warning; amber outline = tight. ? = stale.'
     $tips += 'Click to ' + $(if ($window.IsVisible) { 'hide' } else { 'show' }) + ' the widget; drag to move.'
-    foreach ($s in $script:strips) { $s.Card.ToolTip = $tips -join "`n" }
+    $tipText = $tips -join "`n"
+    foreach ($s in $script:strips) {
+        if ($s.Card.ToolTip -is [Windows.Controls.ToolTip] -and $s.Card.ToolTip.Content -is [Windows.Controls.TextBlock]) {
+            $s.Card.ToolTip.Content.Text = $tipText
+        } else {
+            $tt = [Windows.Controls.ToolTip]::new()
+            $tt.Placement = [Windows.Controls.Primitives.PlacementMode]::Top
+            $tt.PlacementTarget = $s.Card
+            $tt.VerticalOffset = -8.0
+            $tb = [Windows.Controls.TextBlock]::new()
+            $tb.Text = $tipText
+            $tb.MaxWidth = 520
+            $tb.TextWrapping = [Windows.TextWrapping]::Wrap
+            $tt.Content = $tb
+            $s.Card.ToolTip = $tt
+        }
+    }
 }
 
 # One strip window per taskbar it sits on. Event handlers find their strip in the
@@ -1995,6 +2511,9 @@ function New-StripWindow {
     $s = @{ Window = $w; Card = $w.FindName('StripCard'); Rows = $w.FindName('StripRows'); Hwnd = [IntPtr]::Zero; Source = $null }
     $w.Tag = $s
     $s.Card.Background = $HitBrush
+    [Windows.Controls.ToolTipService]::SetShowDuration($s.Card, 60000)
+    [Windows.Controls.ToolTipService]::SetPlacement($s.Card, [Windows.Controls.Primitives.PlacementMode]::Top)
+    [Windows.Controls.ToolTipService]::SetVerticalOffset($s.Card, -8.0)
     # Click toggles the widget, drag slides the strip along the taskbar.
     $w.Add_MouseEnter({ param($o, $e) $o.Tag.Card.Background = $SB.Hover })
     $w.Add_MouseLeave({ param($o, $e) $o.Tag.Card.Background = $HitBrush })
@@ -2133,26 +2652,36 @@ try { Save-LogoIcon $IconPath } catch { Write-WidgetLog "Logo: $_" }
 if (Test-Path $IconPath) { $tray.Icon = [Drawing.Icon]::new($IconPath, [Windows.Forms.SystemInformation]::SmallIconSize) }
 
 function Get-TrayText($Results, [DateTimeOffset]$Now) {
-    $parts = @()
+    $parts = @(); $compactParts = @()
     foreach ($r in @($Results)) {
         if (-not $r) { continue }
         $vals = @()
         foreach ($w in @($r.Windows)) {
-            if (-not $w.ResetsAt -or $w.ResetsAt -le $now) { continue }
+            if (-not $w.ResetsAt -or $w.ResetsAt -le $Now) { continue }
             $value = if ($w.Percent -ge 100) { 'FULL' } else { '{0:0}%' -f $w.Percent }
             if ($w.Label -eq '5-hour') { $vals += '5h ' + $value } elseif ($w.Label -eq 'Weekly') { $vals += 'wk ' + $value }
         }
-        $short = if ($r.Name -eq 'Claude Code') { 'Claude' } else { 'Codex' }
-        if ($r.Error -or ($r.UpdatedAt -and ($Now - $r.UpdatedAt).TotalMinutes -gt 15)) { $short += '?' }
-        if ($vals.Count) { $parts += "$short " + ($vals -join '/') } elseif ($r.Error) { $parts += "$short $($r.Error)" }
+        $short = switch ($r.Name) { 'Claude Code' { 'Claude' } 'Gemini' { 'Gemini' } default { 'Codex' } }
+        $tiny = switch ($r.Name) { 'Claude Code' { 'Cl' } 'Gemini' { 'Gm' } default { 'Cx' } }
+        if ($r.Error -or ($r.UpdatedAt -and ($Now - $r.UpdatedAt).TotalMinutes -gt 15)) { $short += '?'; $tiny += '?' }
+        if ($vals.Count) {
+            $joined = $vals -join '/'
+            $parts += "$short $joined"
+            $compactParts += "$tiny $joined"
+        } elseif ($r.Error) {
+            $parts += "$short $($r.Error)"
+            $compactParts += "$tiny $($r.Error)"
+        }
     }
     $tip = if ($parts.Count) { 'Quota Burndown' + "`n" + ($parts -join "`n") } else { 'Quota Burndown' }
+    if ($tip.Length -gt 63 -and $parts.Count) { $tip = $parts -join "`n" }
+    if ($tip.Length -gt 63 -and $compactParts.Count) { $tip = $compactParts -join "`n" }
     # .NET Framework NotifyIcon (Windows PowerShell 5.1) accepts at most 63 chars.
     if ($tip.Length -gt 63) { $tip.Substring(0, 63) } else { $tip }
 }
 
 function Update-Tray {
-    $tray.Text = Get-TrayText -Results @($sync.Claude, $sync.Codex) -Now ([DateTimeOffset]::UtcNow)
+    $tray.Text = Get-TrayText -Results @($sync.Claude, $sync.Codex, $sync.Gemini) -Now ([DateTimeOffset]::UtcNow)
 }
 
 function Get-BankedResetText($Result, [DateTimeOffset]$Now) {
@@ -2356,6 +2885,7 @@ function Update-View {
     $root.Children.Clear()
     Add-ProviderSection $sync.Claude $true
     Add-ProviderSection $sync.Codex $false
+    Add-ProviderSection $sync.Gemini $false
     Update-UpdateLink
     Update-Strip
     Update-Tray
@@ -2402,10 +2932,20 @@ function Save-ElementPng($Element, [string]$Path) {
 if ($Snapshot) {
     $sync.Claude = (Update-Claude $Settings.ClaudeRefreshMinutes $false ([bool]$Settings.ClaudeAutoRenewLogin)).Result
     $sync.Codex = (Update-Codex $Settings.CodexRefreshMinutes).Result
-    $tc = New-TokenState; $tx = New-TokenState; Update-ClaudeTokens $tc; Update-CodexTokens $tx
-    $sync.Tokens = @{ 'Claude Code' = (Get-WindowTokens $sync.Claude $tc 'claude'); 'Codex' = (Get-WindowTokens $sync.Codex $tx 'codex') }
+    $sync.Gemini = (Update-Gemini $Settings.GeminiRefreshMinutes).Result
+    $tc = New-TokenState; $tx = New-TokenState; $tg = New-TokenState
+    Update-ClaudeTokens $tc; Update-CodexTokens $tx; Update-GeminiTokens $tg
+    $sync.Tokens = @{
+        'Claude Code' = (Get-WindowTokens $sync.Claude $tc 'claude')
+        'Codex'       = (Get-WindowTokens $sync.Codex $tx 'codex')
+        'Gemini'      = (Get-WindowTokens $sync.Gemini $tg 'gemini')
+    }
     $hist = Import-UsageHistory
-    $sync.Forecast = @{ 'Claude Code' = (Get-Forecasts $hist $sync.Claude); 'Codex' = (Get-Forecasts $hist $sync.Codex) }
+    $sync.Forecast = @{
+        'Claude Code' = (Get-Forecasts $hist $sync.Claude)
+        'Codex'       = (Get-Forecasts $hist $sync.Codex)
+        'Gemini'      = (Get-Forecasts $hist $sync.Gemini)
+    }
     Update-View
     Save-ElementPng $card $Snapshot
     # The strip is transparent on screen; give it a taskbar-coloured backdrop for the preview.

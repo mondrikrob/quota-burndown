@@ -9,6 +9,8 @@ Quota Burndown is a single PowerShell script (`QuotaBurndown.ps1`) that you can 
 | `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) | The Claude Code OAuth **access token**, used to call the usage endpoint, and its expiry time. Also the plan type, to price your plan. The widget only reads this file; it never writes it. |
 | `~/.claude/projects/**/*.jsonl` | Token usage per message, for the "tokens burned" and "API value" numbers. Only the `usage`, `model`, `id` and `timestamp` fields are extracted. |
 | `~/.codex/sessions/**/*.jsonl` (or `$CODEX_HOME`) | Token usage and rate-limit snapshots that Codex logs. |
+| `~/.gemini/antigravity/brain/**/.system_generated/logs/transcript.jsonl` | Token usage per planner response (`input_tokens`, `cache_read_tokens`, `output_tokens`) and `Model Selection` changes, for the Gemini "tokens burned" and "API value" numbers. |
+| `~/.gemini/oauth_creds.json` (or `$GEMINI_DIR`) | Optional fallback when Antigravity is not installed: the Gemini CLI OAuth access token, read-only. |
 | `HKCU\...\Themes\Personalize` | Light/dark theme. |
 
 The reader loads chunks of local JSONL files into memory to find usage metadata; these chunks can contain conversation text. The Codex fallback decodes candidate rate-limit events as JSON. The widget does not retain or upload conversation text. Its persisted data contains usage metadata, settings and diagnostic messages.
@@ -16,6 +18,7 @@ The reader loads chunks of local JSONL files into memory to find usage metadata;
 ## What it sends over the network
 
 - `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` with `Authorization: Bearer <Claude Code access token>`, over HTTPS (TLS 1.2+). The response size is capped at 1 MB. The query requests banked-reset information. This block is gated on a Claude Code client header: the widget detects the installed version using `claude --version` (once per process, five-second timeout), includes that version and identifies itself as quota-burndown. If version detection fails or the response omits reset details, those details remain unknown. This remains an undocumented integration, not provider-approved access.
+- For Gemini (Antigravity), the widget inspects local `language_server*.exe` processes for `--csrf_token` and listening loopback ports, then sends `POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/GetUserStatus` and `RetrieveUserQuotaSummary` over loopback only (accepting the local language server's self-signed certificate strictly when `RequestUri.IsLoopback` is true). If Antigravity is not present and `~/.gemini/oauth_creds.json` exists, it falls back to `POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` and `retrieveUserQuota` over HTTPS.
 - **Only if you turned on "Check for updates daily"** (off by default): `GET https://api.github.com/repos/mondrikrob/quota-burndown/releases/latest`, without credentials or usage data. After a successful check, it waits a day; after a failed check, it may retry once an hour. Only the release's version number is used. If it's newer, the widget shows a link to the release page. Nothing is downloaded or installed. The response size is capped at 512 KB.
 - For Codex, the script starts the official `codex app-server` and asks it for your rate limits. Any network traffic from that comes from the Codex CLI itself.
 
@@ -26,6 +29,8 @@ The widget has no telemetry of its own. Requests made by the official CLIs, incl
 The Claude usage endpoint is undocumented. Anthropic's [current credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) restricts third-party handling and routing of subscription credentials. No explicit permission for this monitoring approach has been verified. Calling a read-only usage endpoint or using an official CLI diagnostic does not establish provider approval. Resolve this before claiming broad production readiness.
 
 The Codex integration uses the documented [App Server interface](https://learn.chatgpt.com/docs/app-server). It shows the shared `codex` pool when present; additional model-specific pools are not currently displayed.
+
+The Gemini integration queries the local Antigravity language server (`GetUserStatus` and `RetrieveUserQuotaSummary`) on `127.0.0.1` (or the Gemini CLI Cloud Code quota endpoint). These are internal client endpoints rather than public third-party APIs.
 
 ## How the token is handled
 
@@ -50,6 +55,7 @@ Everything goes to `%USERPROFILE%\.quota-burndown`, which inherits your user pro
 
 - `settings.json`
 - `claude-usage.json`: the last usage response, which contains no credentials
+- `gemini-usage.json`: the last Gemini usage response, which contains no credentials
 - `banked-reset-notifications.json`: observed reset identifiers/counts and expiry-reminder history; no credentials
 - `update-check.json`: when the update check last ran and the latest version number (only if the update check is on)
 - `history.csv`

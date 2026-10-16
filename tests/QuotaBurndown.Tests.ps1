@@ -295,6 +295,8 @@ Describe 'Read-Settings' {
     It 'returns the defaults when there is no file' {
         $s = Read-Settings
         $s.ClaudeRefreshMinutes | Should -Be 5
+        $s.CodexRefreshMinutes | Should -Be 3
+        $s.GeminiRefreshMinutes | Should -Be 3
         $s.Topmost | Should -BeTrue
         $s.ClaudeAutoRenewLogin | Should -BeNullOrEmpty
         $s.CheckForUpdates | Should -BeNullOrEmpty
@@ -307,14 +309,16 @@ Describe 'Read-Settings' {
     }
 
     It 'clamps numbers, rejects wrong types and drops unknown keys' {
-        Set-Content $SettingsPath '{"Topmost":"yes","ClaudeRefreshMinutes":1,"CodexRefreshMinutes":"abc","Left":1e12,"StripOffset":true,"ClaudePlanUsdPerMonth":-5,"Unknown":1}'
+        Set-Content $SettingsPath '{"Topmost":"yes","ClaudeRefreshMinutes":1,"CodexRefreshMinutes":"abc","GeminiRefreshMinutes":0,"Left":1e12,"StripOffset":true,"ClaudePlanUsdPerMonth":-5,"GeminiPlanUsdPerMonth":20,"Unknown":1}'
         $s = Read-Settings
         $s.Topmost | Should -BeTrue
         $s.ClaudeRefreshMinutes | Should -Be 5
         $s.CodexRefreshMinutes | Should -Be 3
+        $s.GeminiRefreshMinutes | Should -Be 1
         $s.Left | Should -Be 100000
         $s.StripOffset | Should -Be 8
         $s.ClaudePlanUsdPerMonth | Should -Be 0
+        $s.GeminiPlanUsdPerMonth | Should -Be 20
         $s.Contains('Unknown') | Should -BeFalse
     }
 
@@ -422,6 +426,20 @@ Describe 'Tray text compatibility' {
         $text.Length | Should -BeLessOrEqual 63
         ([regex]::Matches($text, 'FULL')).Count | Should -Be 4
     }
+    It 'fits all six exhausted windows across Claude, Codex, and Gemini in the PowerShell 5.1 tooltip limit' {
+        $now = [DateTimeOffset]::UtcNow
+        $results = foreach ($name in 'Claude Code', 'Codex', 'Gemini') {
+            $r = New-UsageResult $name; $r.UpdatedAt = $now
+            $r.Windows = @(
+                (New-UsageWindow '5-hour' 100 300 $now.AddHours(1))
+                (New-UsageWindow 'Weekly' 100 10080 $now.AddDays(1))
+            )
+            $r
+        }
+        $text = Get-TrayText $results $now
+        $text.Length | Should -BeLessOrEqual 63
+        ([regex]::Matches($text, 'FULL')).Count | Should -Be 6
+    }
     It 'marks stale values in the tooltip' {
         $now = [DateTimeOffset]::UtcNow
         $r = New-UsageResult 'Codex'; $r.UpdatedAt = $now.AddMinutes(-30)
@@ -471,11 +489,22 @@ Describe 'Model prices and token accounting' {
         Get-ClaudePrice 'claude-opus-4-9' | Should -BeNullOrEmpty
         Get-CodexPrice 'gpt-future-99' | Should -BeNullOrEmpty
         Get-CodexPrice 'gpt-5.5-pro' | Should -BeNullOrEmpty
+        Get-GeminiPrice 'gemini-future-99' | Should -BeNullOrEmpty
+        Get-GeminiPrice 'claude-opus-4-6' | Should -BeNullOrEmpty
     }
     It 'prices legacy Opus 4 correctly and accepts its dated ID' {
         (Get-ClaudePrice 'claude-opus-4-20250514')[1] | Should -Be 15
         (Get-ClaudePrice 'claude-opus-4-5')[1] | Should -Be 5
         (Get-ClaudePrice 'claude-sonnet-5-5')[5] | Should -Be 0.10
+    }
+    It 'prices Gemini models and subscription plans accurately' {
+        (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[1] | Should -Be 2.00
+        (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[2] | Should -Be 0.10
+        (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[3] | Should -Be 10.00
+        (Get-GeminiPrice 'gemini-3.8-flash')[1] | Should -Be 0.75
+        (Get-GeminiPrice 'gemini-3.8-flash')[3] | Should -Be 3.75
+        (Get-PlanUsdPerMonth 'Gemini' 'pro') | Should -Be 20
+        (Get-PlanUsdPerMonth 'Gemini' 'ultra') | Should -Be 250
     }
     It 'counts cumulative Codex increments once and separates cached input' {
         $now = [DateTimeOffset]::UtcNow
@@ -500,6 +529,82 @@ Describe 'Model prices and token accounting' {
         $sum.Total | Should -Be 110
         $sum.Unpriced | Should -Be 110
         $sum.Cost | Should -Be 0
+    }
+}
+
+Describe 'Gemini quota and token parsing' {
+    It 'parses RetrieveUserQuotaSummary groups into 5-hour, Weekly, and scoped Weekly · Argon windows' {
+        $now = [DateTimeOffset]::UtcNow
+        $r5 = $now.AddHours(4).ToString('o')
+        $rw = $now.AddDays(5).ToString('o')
+        $payload = [pscustomobject]@{
+            userStatus = [pscustomobject]@{
+                userTier = [pscustomobject]@{ description = 'Google AI Pro' }
+                planStatus = [pscustomobject]@{ planInfo = [pscustomobject]@{ planName = 'Pro' } }
+            }
+            quotaSummary = [pscustomobject]@{
+                groups = @(
+                    [pscustomobject]@{
+                        displayName = 'Gemini Models'
+                        buckets = @(
+                            [pscustomobject]@{ bucketId = 'gemini-weekly'; window = 'weekly'; remainingFraction = 0.995345; resetTime = $rw }
+                            [pscustomobject]@{ bucketId = 'gemini-5h'; window = '5h'; remainingFraction = 0.9837074; resetTime = $r5 }
+                        )
+                    }
+                    [pscustomobject]@{
+                        displayName = 'Claude and GPT models'
+                        buckets = @(
+                            [pscustomobject]@{ bucketId = '3p-weekly'; window = 'weekly'; remainingFraction = 0.25; resetTime = $rw }
+                        )
+                    }
+                    [pscustomobject]@{
+                        displayName = 'Gemini 4 Argon'
+                        buckets = @(
+                            [pscustomobject]@{ bucketId = 'gemini-argon-wtu-weekly'; window = 'weekly'; remainingFraction = 0.29805547; resetTime = $rw }
+                        )
+                    }
+                )
+            }
+        }
+        $parsed = ConvertFrom-GeminiPayload $payload
+        $parsed.Plan | Should -Be 'Pro'
+        $parsed.PlanKey | Should -Be 'pro'
+        $parsed.Windows | Should -HaveCount 3
+        $parsed.Windows[0].Label | Should -Be '5-hour'
+        [Math]::Round($parsed.Windows[0].Percent, 2) | Should -Be 1.63
+        $parsed.Windows[1].Label | Should -Be 'Weekly'
+        [Math]::Round($parsed.Windows[1].Percent, 2) | Should -Be 0.47
+        $parsed.Windows[2].Label | Should -Be ('Weekly ' + [char]0x00B7 + ' Argon')
+        [Math]::Round($parsed.Windows[2].Percent, 2) | Should -Be 70.19
+    }
+
+    It 'parses Antigravity transcript token steps, tracks Model Selection, and ignores non-Gemini models' {
+        $savedGeminiDir = (Get-Item Function:\Get-GeminiDir).ScriptBlock
+        try {
+            function Get-GeminiDir { $TestDrive }
+            $logDir = Join-Path $TestDrive 'antigravity\brain\conv-1\.system_generated\logs'
+            $null = New-Item -ItemType Directory -Force $logDir
+            $logFile = Join-Path $logDir 'transcript.jsonl'
+            $now = [DateTimeOffset]::UtcNow
+            $lines = @(
+                ('{"step_index":1,"type":"USER_INPUT","created_at":"' + $now.AddMinutes(-10).ToString('o') + '","content":"changed setting `Model Selection` from None to Gemini 4 Argon (Medium). No need to comment"}')
+                ('{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"' + $now.AddMinutes(-9).ToString('o') + '","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":500}')
+                ('{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"' + $now.AddMinutes(-9).ToString('o') + '","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":500}')
+                ('{"step_index":3,"type":"USER_INPUT","created_at":"' + $now.AddMinutes(-5).ToString('o') + '","content":"changed setting `Model Selection` from Gemini 4 Argon (Medium) to Claude Opus 4.6 (Thinking). No need to comment"}')
+                ('{"step_index":4,"type":"PLANNER_RESPONSE","created_at":"' + $now.AddMinutes(-4).ToString('o') + '","input_tokens":9000,"cache_read_tokens":9000,"output_tokens":9000}')
+            )
+            [IO.File]::WriteAllLines($logFile, $lines)
+            $st = New-TokenState
+            Update-GeminiTokens $st
+            $sum = Measure-GeminiTokens $st $now.AddHours(-1)
+            $sum.Input | Should -Be 1000
+            $sum.CacheRead | Should -Be 2000
+            $sum.Output | Should -Be 500
+            $sum.Total | Should -Be 3500
+            [Math]::Round($sum.Cost, 6) | Should -Be 0.0072
+        } finally {
+            Set-Item Function:\Get-GeminiDir -Value $savedGeminiDir
+        }
     }
 }
 
