@@ -64,7 +64,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.8.0'
+$AppVersion = '1.9.0'
 
 if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
     throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'

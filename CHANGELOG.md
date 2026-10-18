@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.9.0 (2026-10-18)
+
+- **Google Gemini (Antigravity & Gemini CLI) support:**
+  - Rate-limit tracking for 5-hour and Weekly quota windows, with separate tracking for scoped models (e.g. `Weekly · Argon` under Pro plans).
+  - Auto-detection of Gemini subscription tiers (Google AI Pro $20/mo, Ultra $250/mo) and plan value comparison.
+  - 3rd pair of taskbar strip signal bars (blue `5h` and `7d`), tray tooltip compacting, and cached fallback display when Antigravity is closed.
+  - Transcript token accounting and API list-pricing for Gemini models from Antigravity logs (`transcript.jsonl`).
+- **Gemini Flash Scout MCP integration:**
+  - Integrated intake token accounting for `gemini-scout-mcp` via `scout-usage.jsonl` with automatic transcript deduplication, priced under Gemini 3.8 Flash.
+- **Pricing and model handling updates:**
+  - Added `claude-haiku-5-5` pricing and handled `codex-auto-review` models.
+- **Documentation and runtime requirements:**
+  - Clarified and documented that Antigravity must be running (can be minimized) for live loopback quota queries, while countdown timers and cached snapshots persist when closed.
+
 ## 1.8.0 (2026-10-16)
 
 - Show banked reset counts and the next expiry for Claude Code and Codex. Click the reset information to open the provider's usage page; it is also available in the taskbar tooltip.
