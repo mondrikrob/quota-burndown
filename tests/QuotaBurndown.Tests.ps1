@@ -582,8 +582,10 @@ Describe 'Gemini quota and token parsing' {
 
     It 'parses Antigravity transcript token steps, tracks Model Selection, and ignores non-Gemini models' {
         $savedGeminiDir = (Get-Item Function:\Get-GeminiDir).ScriptBlock
+        $savedDataDir = (Get-Item Function:\Get-DataFile).ScriptBlock
         try {
             function Get-GeminiDir { $TestDrive }
+            function Get-DataFile([string]$Name) { Join-Path $TestDrive $Name }
             $logDir = Join-Path $TestDrive 'antigravity\brain\conv-1\.system_generated\logs'
             $null = New-Item -ItemType Directory -Force $logDir
             $logFile = Join-Path $logDir 'transcript.jsonl'
@@ -606,6 +608,35 @@ Describe 'Gemini quota and token parsing' {
             [Math]::Round($sum.Cost, 6) | Should -Be 0.0072
         } finally {
             Set-Item Function:\Get-GeminiDir -Value $savedGeminiDir
+            Set-Item Function:\Get-DataFile -Value $savedDataDir
+        }
+    }
+
+    It 'parses Scout MCP scout-usage.jsonl tokens and prices them as Gemini 3.8 Flash' {
+        $savedGeminiDir = (Get-Item Function:\Get-GeminiDir).ScriptBlock
+        $savedDataDir = (Get-Item Function:\Get-DataFile).ScriptBlock
+        try {
+            function Get-GeminiDir { Join-Path $TestDrive 'scout-gemini' }
+            function Get-DataFile([string]$Name) { Join-Path $TestDrive $Name }
+            $scoutFile = Join-Path $TestDrive 'scout-usage.jsonl'
+            $now = [DateTimeOffset]::UtcNow
+            $lines = @(
+                ('{"timestamp":"' + $now.AddMinutes(-5).ToString('o') + '","model":"Gemini 3.8 Flash","input_tokens":10000,"cache_read_tokens":2000,"output_tokens":1000,"conversation_id":"scout-conv-1","tool":"scout_files"}')
+            )
+            [IO.File]::WriteAllLines($scoutFile, $lines)
+            $st = New-TokenState
+            Update-GeminiTokens $st
+            $sum = Measure-GeminiTokens $st $now.AddHours(-1)
+            $sum.Input | Should -Be 10000
+            $sum.CacheRead | Should -Be 2000
+            $sum.Output | Should -Be 1000
+            $sum.Total | Should -Be 13000
+            # Gemini 3.8 Flash: input $0.75/M, cache read $0.075/M, output $3.75/M
+            # Cost = (10000*0.75 + 2000*0.075 + 1000*3.75) / 1e6 = 0.0114
+            [Math]::Round($sum.Cost, 6) | Should -Be 0.0114
+        } finally {
+            Set-Item Function:\Get-GeminiDir -Value $savedGeminiDir
+            Set-Item Function:\Get-DataFile -Value $savedDataDir
         }
     }
 }

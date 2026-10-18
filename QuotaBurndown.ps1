@@ -1369,53 +1369,99 @@ namespace QuotaBurndown {
 
     function Update-GeminiTokens($State) {
         $root = Join-Path (Get-GeminiDir) 'antigravity\brain'
-        if (-not (Test-Path $root)) { return }
         $cut = [DateTimeOffset]::UtcNow.AddDays(-8)
-        if (([DateTime]::UtcNow - $State.ListedAt).TotalMinutes -ge 5) {
-            $State.List = @(Get-ChildItem $root -Recurse -Filter 'transcript.jsonl' -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.LastWriteTimeUtc -gt $cut.UtcDateTime } | ForEach-Object { $_.FullName })
-            $State.ListedAt = [DateTime]::UtcNow
-            foreach ($k in @($State.Files.Keys)) { if ($State.List -notcontains $k) { $State.Files.Remove($k) } }
-        }
-        foreach ($path in $State.List) {
-            try { $lines = Read-NewLines $State.Files $path } catch { continue }
-            $st = $State.Files[$path]
-            $entries = $st.Entries
-            foreach ($l in $lines) {
-                if ($l.Contains('"type":"USER_INPUT"') -and $l.Contains('Model Selection')) {
-                    $m = [regex]::Match($l, 'changed setting `Model Selection` from [^\r\n\\]+? to ([^\r\n\\<]+?)\. No need to comment')
-                    if ($m.Success) { $st.Model = $m.Groups[1].Value.Trim() }
-                    continue
+        if (Test-Path $root) {
+            if (([DateTime]::UtcNow - $State.ListedAt).TotalMinutes -ge 5) {
+                $State.List = @(Get-ChildItem $root -Recurse -Filter 'transcript.jsonl' -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTimeUtc -gt $cut.UtcDateTime } | ForEach-Object { $_.FullName })
+                $State.ListedAt = [DateTime]::UtcNow
+                foreach ($k in @($State.Files.Keys)) {
+                    if ($k -notlike '*scout-usage.jsonl' -and $State.List -notcontains $k) { $State.Files.Remove($k) }
                 }
-                if (-not $l.Contains('"type":"PLANNER_RESPONSE"')) { continue }
-                if ($st.Model -and $st.Model -match '^(Claude|GPT)\b') { continue }
-                $ts = [regex]::Match($l, '"created_at":"([^"]+)"')
-                if (-not $ts.Success) { continue }
-                try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
-                $inTok = Get-UsageField $l 'input_tokens'
-                $cacheRead = Get-UsageField $l 'cache_read_tokens'
-                $outTok = Get-UsageField $l 'output_tokens'
-                if (($inTok + $cacheRead + $outTok) -le 0) { continue }
-                $step = [regex]::Match($l, '"step_index":(\d+)')
-                $modelName = if ($st.Model) { $st.Model } else { 'Gemini 4 Argon' }
-                $e = [pscustomobject]@{
-                    Id        = $(if ($step.Success) { $path + '#' + $step.Groups[1].Value } else { $null })
-                    At        = $at
-                    Model     = $modelName
-                    Input     = $inTok
-                    CacheRead = $cacheRead
-                    Output    = $outTok
-                    Cost      = [double]0
-                    Unpriced  = [long]0
-                }
-                $p = Get-GeminiPrice $modelName
-                if ($p) { $e.Cost = ($e.Input * $p[1] + $e.CacheRead * $p[2] + $e.Output * $p[3]) / 1e6 }
-                else { $e.Unpriced = $e.Input + $e.CacheRead + $e.Output }
-                $null = $entries.Add($e)
             }
-            if ($entries.Count -and $entries[0].At -lt $cut) {
-                $keep = @($entries | Where-Object { $_.At -ge $cut })
-                $entries.Clear(); foreach ($e in $keep) { $null = $entries.Add($e) }
+            foreach ($path in $State.List) {
+                try { $lines = Read-NewLines $State.Files $path } catch { continue }
+                $st = $State.Files[$path]
+                $entries = $st.Entries
+                foreach ($l in $lines) {
+                    if ($l.Contains('"type":"USER_INPUT"') -and $l.Contains('Model Selection')) {
+                        $m = [regex]::Match($l, 'changed setting `Model Selection` from [^\r\n\\]+? to ([^\r\n\\<]+?)\. No need to comment')
+                        if ($m.Success) { $st.Model = $m.Groups[1].Value.Trim() }
+                        continue
+                    }
+                    if (-not $l.Contains('"type":"PLANNER_RESPONSE"')) { continue }
+                    if ($st.Model -and $st.Model -match '^(Claude|GPT)\b') { continue }
+                    $ts = [regex]::Match($l, '"created_at":"([^"]+)"')
+                    if (-not $ts.Success) { continue }
+                    try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+                    $inTok = Get-UsageField $l 'input_tokens'
+                    $cacheRead = Get-UsageField $l 'cache_read_tokens'
+                    $outTok = Get-UsageField $l 'output_tokens'
+                    if (($inTok + $cacheRead + $outTok) -le 0) { continue }
+                    $step = [regex]::Match($l, '"step_index":(\d+)')
+                    $modelName = if ($st.Model) { $st.Model } else { 'Gemini 4 Argon' }
+                    $e = [pscustomobject]@{
+                        Id        = $(if ($step.Success) { $path + '#' + $step.Groups[1].Value } else { $null })
+                        At        = $at
+                        Model     = $modelName
+                        Input     = $inTok
+                        CacheRead = $cacheRead
+                        Output    = $outTok
+                        Cost      = [double]0
+                        Unpriced  = [long]0
+                    }
+                    $p = Get-GeminiPrice $modelName
+                    if ($p) { $e.Cost = ($e.Input * $p[1] + $e.CacheRead * $p[2] + $e.Output * $p[3]) / 1e6 }
+                    else { $e.Unpriced = $e.Input + $e.CacheRead + $e.Output }
+                    $null = $entries.Add($e)
+                }
+                if ($entries.Count -and $entries[0].At -lt $cut) {
+                    $keep = @($entries | Where-Object { $_.At -ge $cut })
+                    $entries.Clear(); foreach ($e in $keep) { $null = $entries.Add($e) }
+                }
+            }
+        }
+        $scoutLog = Get-DataFile 'scout-usage.jsonl'
+        if (Test-Path $scoutLog) {
+            try { $lines = Read-NewLines $State.Files $scoutLog } catch { $lines = @() }
+            if ($lines) {
+                $st = $State.Files[$scoutLog]
+                $entries = $st.Entries
+                foreach ($l in $lines) {
+                    if (-not $l.Trim()) { continue }
+                    $cid = [regex]::Match($l, '"conversation_id":"([^"]+)"')
+                    if ($cid.Success -and @($State.List | Where-Object { $_ -like ('*' + $cid.Groups[1].Value + '*') }).Count -gt 0) {
+                        continue
+                    }
+                    $ts = [regex]::Match($l, '"timestamp":"([^"]+)"')
+                    if (-not $ts.Success) { continue }
+                    try { $at = [DateTimeOffset]::Parse($ts.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+                    $inTok = Get-UsageField $l 'input_tokens'
+                    $cacheRead = Get-UsageField $l 'cache_read_tokens'
+                    $outTok = Get-UsageField $l 'output_tokens'
+                    if (($inTok + $cacheRead + $outTok) -le 0) { continue }
+                    $mModel = [regex]::Match($l, '"model":"([^"]+)"')
+                    $modelName = if ($mModel.Success) { $mModel.Groups[1].Value.Trim() } else { 'Gemini 3.8 Flash' }
+                    $eId = if ($cid.Success) { 'scout:' + $cid.Groups[1].Value } else { $null }
+                    $e = [pscustomobject]@{
+                        Id        = $eId
+                        At        = $at
+                        Model     = $modelName
+                        Input     = $inTok
+                        CacheRead = $cacheRead
+                        Output    = $outTok
+                        Cost      = [double]0
+                        Unpriced  = [long]0
+                    }
+                    $p = Get-GeminiPrice $modelName
+                    if ($p) { $e.Cost = ($e.Input * $p[1] + $e.CacheRead * $p[2] + $e.Output * $p[3]) / 1e6 }
+                    else { $e.Unpriced = $e.Input + $e.CacheRead + $e.Output }
+                    $null = $entries.Add($e)
+                }
+                if ($entries.Count -and $entries[0].At -lt $cut) {
+                    $keep = @($entries | Where-Object { $_.At -ge $cut })
+                    $entries.Clear(); foreach ($e in $keep) { $null = $entries.Add($e) }
+                }
             }
         }
     }
