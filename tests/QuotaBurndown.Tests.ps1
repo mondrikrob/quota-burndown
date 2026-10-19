@@ -807,3 +807,48 @@ Describe 'ConvertTo-ReleaseVersion' {
         ConvertTo-ReleaseVersion $Tag | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Get-WindowHistory and Get-ToolHistoryMap' {
+    It 'extracts window history within the active window span and reset timestamp' {
+        $now = [DateTimeOffset]::UtcNow
+        $reset = $now.AddHours(2)
+        $w = [pscustomobject]@{
+            Label = '5-hour'
+            Minutes = 300
+            ResetsAt = $reset
+        }
+        $history = @(
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = '5-hour'; At = $now.AddMinutes(-350); Percent = 5.0; ResetsAt = $reset.ToUnixTimeSeconds() }
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = '5-hour'; At = $now.AddMinutes(-120); Percent = 30.0; ResetsAt = $reset.ToUnixTimeSeconds() }
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = '5-hour'; At = $now.AddMinutes(-30); Percent = 55.0; ResetsAt = $reset.ToUnixTimeSeconds() }
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = '5-hour'; At = $now.AddMinutes(-10); Percent = 60.0; ResetsAt = $reset.AddDays(7).ToUnixTimeSeconds() }
+            [pscustomobject]@{ Tool = 'Codex'; Label = '5-hour'; At = $now.AddMinutes(-20); Percent = 15.0; ResetsAt = $reset.ToUnixTimeSeconds() }
+        )
+        $pts = Get-WindowHistory $history 'Claude Code' $w
+        $pts | Should -HaveCount 2
+        $pts[0].Percent | Should -Be 30.0
+        $pts[1].Percent | Should -Be 55.0
+    }
+
+    It 'builds tool history map across all windows for a provider' {
+        $now = [DateTimeOffset]::UtcNow
+        $reset = $now.AddHours(2)
+        $res = [pscustomobject]@{
+            Name = 'Claude Code'
+            Windows = @(
+                [pscustomobject]@{ Label = '5-hour'; Minutes = 300; ResetsAt = $reset }
+                [pscustomobject]@{ Label = 'Weekly'; Minutes = 10080; ResetsAt = $reset.AddDays(5) }
+            )
+        }
+        $history = @(
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = '5-hour'; At = $now.AddMinutes(-60); Percent = 40.0; ResetsAt = $reset.ToUnixTimeSeconds() }
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $now.AddDays(-1); Percent = 25.0; ResetsAt = $reset.AddDays(5).ToUnixTimeSeconds() }
+        )
+        $map = Get-ToolHistoryMap $history $res
+        $map.Keys | Should -Contain '5-hour'
+        $map.Keys | Should -Contain 'Weekly'
+        $map['5-hour'] | Should -HaveCount 1
+        $map['Weekly'] | Should -HaveCount 1
+    }
+}
+

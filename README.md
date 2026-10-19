@@ -49,6 +49,7 @@ At 100% (sample data): <img src="docs/limit-reached-strip.png" height="52" alt="
 
 - **Desktop widget.** Compact by design: two lines per window, with the details on hover.
   - **Each window:** % used, how far over or under the even pace you are (e.g. "9% under"), and when it resets (e.g. "🕒 Sun 19:35 · 2d 3h", shown with a clock icon). Below that is a bar whose white tick marks where an even pace would put you.
+  - **Expandable visual burndown charts:** click any active window row to expand an inline 2D vector burndown graph plotted directly from your local `history.csv` samples. It plots the dashed ideal pace line, your actual shaded burn curve with a current position marker, and the projected run-out trajectory cone leading to reset or exhaustion, complete with real-time burn velocity (`%/h`) and window token totals.
   - **Run-out warning:** appears only when it matters, based on your recent burn rate (the last hour for the 5-hour window, today for the weekly one):
     - **Red:** you're over the even pace *and* will run out well before the reset, e.g. "⚠ runs out ~17:21, 2h 38m before reset".
     - **Amber "tight":** you'd run out only shortly before the reset, or you're still under the even pace, e.g. "tight: at today's rate, out ~Sun 13:11".

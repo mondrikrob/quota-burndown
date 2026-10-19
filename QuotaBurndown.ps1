@@ -1,12 +1,12 @@
-<#
+﻿<#
 .SYNOPSIS
     Desktop widget, taskbar strip and tray icon for Claude Code, Codex and Gemini usage limits.
 
 .DESCRIPTION
     Shows the 5-hour and weekly rate-limit windows of Claude Code, OpenAI Codex and
     Google Gemini (Antigravity / Gemini CLI), where you would be at an even pace, a
-    run-out forecast, the tokens you burned (from local logs) and what those tokens
-    would have cost at API prices.
+    run-out forecast, expandable visual burndown charts plotted from local history, the tokens
+    you burned (from local logs) and what those tokens would have cost at API prices.
 
     Data sources
       Claude Code  GET https://api.anthropic.com/api/oauth/usage, authenticated with the
@@ -64,7 +64,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.9.0'
+$AppVersion = '1.10.0'
 
 if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
     throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'
@@ -1637,6 +1637,25 @@ namespace QuotaBurndown {
         $out
     }
 
+    function Get-WindowHistory($History, [string]$Tool, $w) {
+        if (-not $w.ResetsAt) { return @() }
+        $reset = $w.ResetsAt.ToUnixTimeSeconds()
+        $start = $w.ResetsAt.AddMinutes(-$w.Minutes)
+        @($History | Where-Object {
+            $_.Tool -eq $Tool -and $_.Label -eq $w.Label -and [Math]::Abs($_.ResetsAt - $reset) -le 120 -and $_.At -ge $start
+        } | Sort-Object At)
+    }
+
+    function Get-ToolHistoryMap($History, $Result) {
+        $out = @{}
+        if (-not $Result -or -not $Result.Windows) { return $out }
+        foreach ($w in @($Result.Windows)) {
+            if (-not $w.ResetsAt) { continue }
+            $out[$w.Label] = Get-WindowHistory $History $Result.Name $w
+        }
+        $out
+    }
+
     # ----- update check (opt-in) --------------------------------------------
     # Only reads the latest release's version number. Nothing is downloaded or run;
     # the widget just offers a link to the release page.
@@ -1964,7 +1983,7 @@ if (-not ('QuotaBurndown.Native' -as [type])) {
 # ----- background worker ---------------------------------------------------
 
 $sync = [hashtable]::Synchronized(@{
-        Claude = $null; Codex = $null; Gemini = $null; Tokens = @{}; Forecast = @{}
+        Claude = $null; Codex = $null; Gemini = $null; Tokens = @{}; Forecast = @{}; History = @{}
         Version = 0; RefreshRequested = $false; Stop = $false
         ClaudeInterval = $Settings.ClaudeRefreshMinutes; CodexInterval = $Settings.CodexRefreshMinutes; GeminiInterval = $Settings.GeminiRefreshMinutes
         AutoRenew = [bool]$Settings.ClaudeAutoRenewLogin; CheckUpdates = [bool]$Settings.CheckForUpdates; Update = $null; AppVersion = $AppVersion
@@ -2050,6 +2069,11 @@ $WorkerLoop = {
                     'Claude Code' = (Get-Forecasts $history $sync.Claude)
                     'Codex'       = (Get-Forecasts $history $sync.Codex)
                     'Gemini'      = (Get-Forecasts $history $sync.Gemini)
+                }
+                $sync.History = @{
+                    'Claude Code' = (Get-ToolHistoryMap $history $sync.Claude)
+                    'Codex'       = (Get-ToolHistoryMap $history $sync.Codex)
+                    'Gemini'      = (Get-ToolHistoryMap $history $sync.Gemini)
                 }
             } catch { Write-WidgetLog "Derived values: $_" }
             $derivedNext = $now + 60
@@ -2206,9 +2230,228 @@ $null = $topButtons.Children.Add((New-IconButton $Glyph.Minimize 'Minimize to th
 
 function Format-UsdShort([double]$n) { if ($n -ge 10) { '$' + [Math]::Round($n).ToString('#,0', [Globalization.CultureInfo]::InvariantCulture) } else { Format-Usd $n } }
 
+$script:expandedWindows = @{}
+
+function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBrush) {
+    if (-not $w.ResetsAt -or $w.Minutes -le 0) { return $null }
+
+    $border = [Windows.Controls.Border]::new()
+    $border.Width = $BarWidth; $border.CornerRadius = 6; $border.Background = $B.Hover
+    $border.BorderBrush = $B.Track; $border.BorderThickness = 1; $border.Padding = '6,5,6,6'; $border.Margin = '0,6,0,0'
+
+    $panel = [Windows.Controls.StackPanel]::new()
+
+    # Header dock: Title on left, legend on right
+    $hdr = [Windows.Controls.DockPanel]::new()
+    $hdr.Margin = '0,0,0,3'
+    $legend = [Windows.Controls.TextBlock]::new()
+    $legend.FontSize = 8.5; $legend.VerticalAlignment = 'Center'
+    [Windows.Controls.DockPanel]::SetDock($legend, 'Right')
+    Add-Run $legend '-- ideal  ' $B.Muted 8.5 $null
+    Add-Run $legend '— actual  ' $titleBrush 8.5 $null
+    Add-Run $legend '··· fcst' $B[$sev] 8.5 $null
+    $null = $hdr.Children.Add($legend)
+
+    $title = [Windows.Controls.TextBlock]::new()
+    $title.FontSize = 9.5; $title.FontWeight = [Windows.FontWeights]::SemiBold; $title.Foreground = $B.Text
+    $title.Text = "$($w.Label) Burndown"
+    $null = $hdr.Children.Add($title)
+    $null = $panel.Children.Add($hdr)
+
+    # Canvas: 222 width, 70 height
+    $c = [Windows.Controls.Canvas]::new()
+    $c.Width = 222; $c.Height = 70; $c.ClipToBounds = $true
+
+    $xMin = 22.0; $xMax = 216.0; $plotW = $xMax - $xMin
+    $yTop = 6.0; $yBottom = 52.0; $plotH = $yBottom - $yTop
+
+    # Grid lines & Y labels: 100%, 50%, 0%
+    $gridDash = [Windows.Media.DoubleCollection]::Parse('2,2')
+    foreach ($lvl in @(
+        @{ Y = $yTop; Label = '100%'; YText = 0 },
+        @{ Y = ($yTop + $yBottom) / 2.0; Label = '50%'; YText = (($yTop + $yBottom) / 2.0) - 6 },
+        @{ Y = $yBottom; Label = '0%'; YText = $yBottom - 6 }
+    )) {
+        $gl = [Windows.Shapes.Line]::new()
+        $gl.X1 = $xMin; $gl.Y1 = $lvl.Y; $gl.X2 = $xMax; $gl.Y2 = $lvl.Y
+        $gl.Stroke = $B.Track; $gl.StrokeThickness = 0.8; $gl.StrokeDashArray = $gridDash
+        $null = $c.Children.Add($gl)
+
+        $lbl = New-Text $lvl.Label $B.Muted 8
+        [Windows.Controls.Canvas]::SetLeft($lbl, 0)
+        [Windows.Controls.Canvas]::SetTop($lbl, $lvl.YText)
+        $null = $c.Children.Add($lbl)
+    }
+
+    $tStart = $w.ResetsAt.AddMinutes(-$w.Minutes)
+    $tReset = $w.ResetsAt
+    $totalMins = [Math]::Max(1.0, [double]$w.Minutes)
+    $elapsedMins = [Math]::Max(0.0, [Math]::Min($totalMins, ($Now - $tStart).TotalMinutes))
+    $xNow = $xMin + ($elapsedMins / $totalMins) * $plotW
+    $yNow = $yBottom - ([Math]::Max(0.0, [Math]::Min(100.0, $w.Percent)) / 100.0) * $plotH
+
+    # Ideal pace line: (xMin, yBottom) -> (xMax, yTop)
+    $ideal = [Windows.Shapes.Line]::new()
+    $ideal.X1 = $xMin; $ideal.Y1 = $yBottom; $ideal.X2 = $xMax; $ideal.Y2 = $yTop
+    $ideal.Stroke = $B.Tick; $ideal.StrokeThickness = 1.0
+    $ideal.StrokeDashArray = [Windows.Media.DoubleCollection]::Parse('3,2')
+    $null = $c.Children.Add($ideal)
+
+    # History points
+    $rawHistory = Get-Derived 'History' $r.Name $w.Label
+    $polyPoints = [Windows.Media.PointCollection]::new()
+    $areaPoints = [Windows.Media.PointCollection]::new()
+
+    # Anchor at start of window (0% used)
+    $startPt = [Windows.Point]::new($xMin, $yBottom)
+    $null = $polyPoints.Add($startPt)
+    $null = $areaPoints.Add($startPt)
+
+    $lastX = -1.0
+    if ($rawHistory) {
+        foreach ($pt in $rawHistory) {
+            if ($pt.At -gt $Now) { continue }
+            $m = ($pt.At - $tStart).TotalMinutes
+            if ($m -le 0 -or $m -gt $elapsedMins) { continue }
+            $px = [Math]::Round($xMin + ($m / $totalMins) * $plotW, 1)
+            $py = [Math]::Round($yBottom - ([Math]::Max(0.0, [Math]::Min(100.0, $pt.Percent)) / 100.0) * $plotH, 1)
+            if ([Math]::Abs($px - $lastX) -ge 1.0 -or $polyPoints.Count -le 1) {
+                $p = [Windows.Point]::new($px, $py)
+                $null = $polyPoints.Add($p)
+                $null = $areaPoints.Add($p)
+                $lastX = $px
+            }
+        }
+    }
+
+    # Current point
+    $currPt = [Windows.Point]::new($xNow, $yNow)
+    $null = $polyPoints.Add($currPt)
+    $null = $areaPoints.Add($currPt)
+
+    # Shaded polygon area under curve
+    $null = $areaPoints.Add([Windows.Point]::new($xNow, $yBottom))
+    $area = [Windows.Shapes.Polygon]::new()
+    $area.Points = $areaPoints
+    $grad = [Windows.Media.LinearGradientBrush]::new()
+    $grad.StartPoint = [Windows.Point]::new(0, 0); $grad.EndPoint = [Windows.Point]::new(0, 1)
+    $cColor = if ($titleBrush -is [Windows.Media.SolidColorBrush]) { $titleBrush.Color } else { [Windows.Media.Colors]::Orange }
+    $grad.GradientStops.Add([Windows.Media.GradientStop]::new([Windows.Media.Color]::FromArgb(70, $cColor.R, $cColor.G, $cColor.B), 0.0))
+    $grad.GradientStops.Add([Windows.Media.GradientStop]::new([Windows.Media.Color]::FromArgb(0, $cColor.R, $cColor.G, $cColor.B), 1.0))
+    $area.Fill = $grad
+    $null = $c.Children.Add($area)
+
+    # Actual curve
+    $line = [Windows.Shapes.Polyline]::new()
+    $line.Points = $polyPoints
+    $line.Stroke = $titleBrush
+    $line.StrokeThickness = 2.0
+    $null = $c.Children.Add($line)
+
+    # Current position dot
+    $dot = [Windows.Shapes.Ellipse]::new()
+    $dot.Width = 6; $dot.Height = 6; $dot.Fill = $titleBrush; $dot.Stroke = $B.Text; $dot.StrokeThickness = 1.0
+    [Windows.Controls.Canvas]::SetLeft($dot, $xNow - 3.0)
+    [Windows.Controls.Canvas]::SetTop($dot, $yNow - 3.0)
+    $null = $c.Children.Add($dot)
+
+    # Forecast projection line
+    $f = Get-Derived 'Forecast' $r.Name $w.Label
+    if ($f) {
+        $fcLine = [Windows.Shapes.Line]::new()
+        $fcLine.X1 = $xNow; $fcLine.Y1 = $yNow
+        $fcLine.StrokeThickness = 1.5
+        $fcLine.StrokeDashArray = [Windows.Media.DoubleCollection]::Parse('2,2')
+        $fcColor = if ($f.RunsOut) { if ($f.Level -eq 'alert') { $B.Bad } else { $B.Warn } } else { $B.Ok }
+        $fcLine.Stroke = $fcColor
+
+        if ($f.RunsOut -and $f.HitAt) {
+            $hitMins = [Math]::Max(0.0, ($f.HitAt - $tStart).TotalMinutes)
+            $xHit = $xMin + [Math]::Max(0.0, [Math]::Min(1.0, $hitMins / $totalMins)) * $plotW
+            $fcLine.X2 = $xHit; $fcLine.Y2 = $yTop
+            $null = $c.Children.Add($fcLine)
+
+            $hitDot = [Windows.Shapes.Ellipse]::new()
+            $hitDot.Width = 5; $hitDot.Height = 5; $hitDot.Fill = $fcColor
+            [Windows.Controls.Canvas]::SetLeft($hitDot, $xHit - 2.5)
+            [Windows.Controls.Canvas]::SetTop($hitDot, $yTop - 2.5)
+            $null = $c.Children.Add($hitDot)
+        } elseif ($f.Projected -gt 0) {
+            $yProj = $yBottom - ([Math]::Max(0.0, [Math]::Min(100.0, $f.Projected)) / 100.0) * $plotH
+            $fcLine.X2 = $xMax; $fcLine.Y2 = $yProj
+            $null = $c.Children.Add($fcLine)
+        }
+    }
+
+    # X-Axis Time Labels below plot
+    $tLeft = if ($w.Minutes -le 300) { '{0:HH:mm}' -f $tStart.LocalDateTime } else { '{0:ddd}' -f $tStart.LocalDateTime }
+    $tRight = if ($w.Minutes -le 300) { '{0:HH:mm}' -f $tReset.LocalDateTime } else { '{0:ddd}' -f $tReset.LocalDateTime }
+
+    $lblStart = New-Text $tLeft $B.Muted 8
+    [Windows.Controls.Canvas]::SetLeft($lblStart, $xMin)
+    [Windows.Controls.Canvas]::SetTop($lblStart, 56)
+    $null = $c.Children.Add($lblStart)
+
+    $lblNow = New-Text 'NOW' $titleBrush 8
+    $lblNow.FontWeight = [Windows.FontWeights]::Bold
+    [Windows.Controls.Canvas]::SetLeft($lblNow, [Math]::Max($xMin + 18, [Math]::Min($xMax - 26, $xNow - 10)))
+    [Windows.Controls.Canvas]::SetTop($lblNow, 56)
+    $null = $c.Children.Add($lblNow)
+
+    $lblEnd = New-Text $tRight $B.Muted 8
+    [Windows.Controls.Canvas]::SetLeft($lblEnd, $xMax - 18)
+    [Windows.Controls.Canvas]::SetTop($lblEnd, 56)
+    $null = $c.Children.Add($lblEnd)
+
+    $null = $panel.Children.Add($c)
+
+    # Bottom metric strip using standard Grid
+    $grid = [Windows.Controls.Grid]::new()
+    $grid.Margin = '2,3,2,0'
+    $col1 = [Windows.Controls.ColumnDefinition]::new(); $col1.Width = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
+    $col2 = [Windows.Controls.ColumnDefinition]::new(); $col2.Width = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
+    $col3 = [Windows.Controls.ColumnDefinition]::new(); $col3.Width = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
+    $grid.ColumnDefinitions.Add($col1); $grid.ColumnDefinitions.Add($col2); $grid.ColumnDefinitions.Add($col3)
+
+    $burnStr = if ($f -and $f.RatePerHour -gt 0) { '{0:0.#}%/h' -f $f.RatePerHour } else { '0%/h' }
+    $tBurn = New-Text "Burn: $burnStr" $B.Muted 9
+    [Windows.Controls.Grid]::SetColumn($tBurn, 0)
+    $null = $grid.Children.Add($tBurn)
+
+    $tStatus = [Windows.Controls.TextBlock]::new()
+    $tStatus.FontSize = 9; $tStatus.HorizontalAlignment = 'Center'
+    if ($f -and $f.RunsOut -and $f.HitAt) {
+        $when = if (($f.HitAt - $Now).TotalHours -lt 18) { '{0:HH:mm}' -f $f.HitAt.LocalDateTime } else { '{0:ddd HH:mm}' -f $f.HitAt.LocalDateTime }
+        $tStatus.Text = "Out ~$when"
+        $tStatus.Foreground = if ($f.Level -eq 'alert') { $B.Bad } else { $B.Warn }
+    } elseif ($f -and $f.RatePerHour -gt 0) {
+        $tStatus.Text = '~{0:0}% at reset' -f $f.Projected
+        $tStatus.Foreground = $B.Ok
+    } else {
+        $tStatus.Text = 'on pace'
+        $tStatus.Foreground = $B.Ok
+    }
+    [Windows.Controls.Grid]::SetColumn($tStatus, 1)
+    $null = $grid.Children.Add($tStatus)
+
+    $tok = Get-Derived 'Tokens' $r.Name $w.Label
+    $tokStr = if ($tok -and $tok.Total -gt 0) { (Format-Tokens $tok.Total) + ' tok' } else { '0 tok' }
+    $tTok = New-Text $tokStr $B.Muted 9
+    $tTok.HorizontalAlignment = 'Right'
+    [Windows.Controls.Grid]::SetColumn($tTok, 2)
+    $null = $grid.Children.Add($tTok)
+
+    $null = $panel.Children.Add($grid)
+    $border.Child = $panel
+    $border
+}
+
 # One window, compact: "Label  24%  9% under ... (reset) 19:00 . 3h 19m", then the bar.
-# A third line appears only for a forecast warning; everything else is in the tooltip.
-function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
+# Clicking an active window expands a visual burndown curve plotted from local history.
+function Add-WindowRow($r, $w, [DateTimeOffset]$Now, $TitleBrush = $null) {
+    if (-not $TitleBrush) {
+        $TitleBrush = switch ($r.Name) { 'Claude Code' { $B.Claude } 'Gemini' { $B.Gemini } default { $B.Codex } }
+    }
     $row = [Windows.Controls.StackPanel]::new()
     $row.Margin = '0,8,0,0'
     $row.Background = $HitBrush   # so hovering anywhere on the row shows its tooltip
@@ -2219,6 +2462,30 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
     if (-not $expired) {
         $elapsed = [Math]::Max(0.0, [Math]::Min(1.0, 1 - (($w.ResetsAt - $Now).TotalMinutes / $w.Minutes)))
         $diff = [Math]::Round($w.Percent - $elapsed * 100)
+    }
+
+    $k = $r.Name + '|' + $w.Label
+    $isExpanded = $script:expandedWindows.ContainsKey($k) -and -not $expired
+    if (-not $expired) {
+        $row.Cursor = [Windows.Input.Cursors]::Hand
+        $row.Tag = $k
+        $row.Add_PreviewMouseLeftButtonDown({
+            param($s, $e)
+            try {
+                if ($e) { $e.Handled = $true }
+                $key = [string]$s.Tag
+                if ($key) {
+                    if ($script:expandedWindows.ContainsKey($key)) {
+                        $script:expandedWindows.Remove($key)
+                    } else {
+                        $script:expandedWindows[$key] = $true
+                    }
+                    Update-View
+                }
+            } catch {
+                Write-WidgetLog "Toggle chart: $_"
+            }
+        })
     }
 
     # Line 1: label, % used, pace; reset time on the right.
@@ -2236,6 +2503,10 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
     }
     $null = $line.Children.Add($right)
     $left = [Windows.Controls.TextBlock]::new()
+    if (-not $expired) {
+        $chevron = if ($isExpanded) { [string][char]0x25BE + ' ' } else { [string][char]0x25B8 + ' ' }
+        Add-Run $left $chevron $B.Muted 10 $null
+    }
     Add-Run $left $w.Label $B.Text 12 $null
     if (-not $expired) {
         Add-Run $left ('  {0:0}%' -f $w.Percent) $B[$sev] 12 ([Windows.FontWeights]::SemiBold)
@@ -2296,6 +2567,16 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
         $null = $row.Children.Add($fc)
     }
 
+    # Expandable visual burndown chart
+    if ($isExpanded) {
+        try {
+            $chart = New-BurndownChart $r $w $Now $sev $TitleBrush
+            if ($chart) { $null = $row.Children.Add($chart) }
+        } catch {
+            Write-WidgetLog "BurndownChart UI: $_"
+        }
+    }
+
     # Everything else on hover.
     $tip = @()
     if (-not $expired -and $w.Percent -ge 100) { $tip += 'LIMIT REACHED: the last reading reported 100% used. Wait for the reset or check the provider.' }
@@ -2319,6 +2600,9 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now) {
     }
     $tip += ''
     $tip += 'The white tick on the bar marks the even pace.'
+    if (-not $expired) {
+        $tip += if ($isExpanded) { 'Click row to collapse visual burndown chart.' } else { 'Click row to expand visual burndown chart.' }
+    }
     $row.ToolTip = $tip -join "`n"
     $null = $root.Children.Add($row)
 }
@@ -2367,7 +2651,7 @@ function Add-ProviderSection($r, [bool]$First) {
         $null = $root.Children.Add($msg)
         return
     }
-    foreach ($w in @($r.Windows)) { Add-WindowRow $r $w $now }
+    foreach ($w in @($r.Windows)) { Add-WindowRow $r $w $now $titleBrush }
 
     # One summary line: this week's tokens and what they'd cost on the API.
     $week = Get-Derived 'Tokens' $r.Name 'WeeklyAll'
