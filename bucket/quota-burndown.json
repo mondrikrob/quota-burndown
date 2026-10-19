@@ -4,7 +4,7 @@
   "homepage": "https://github.com/mondrikrob/quota-burndown",
   "license": "MIT",
   "url": "https://github.com/mondrikrob/quota-burndown/releases/download/v1.10.0/QuotaBurndown.ps1",
-  "hash": "cc680e0ea810b70db3c9e308464398d5185c751f85d08f2cec53167b74f8393b",
+  "hash": "40c1ed87a5bc1ca1d0a419d55977b0aa508665c15946a6b47a7f5fba77bb86c9",
   "bin": "QuotaBurndown.ps1",
   "notes": [
     "Run 'QuotaBurndown -Install' to add the Start menu entry and start the widget.",

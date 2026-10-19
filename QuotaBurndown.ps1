@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Desktop widget, taskbar strip and tray icon for Claude Code, Codex and Gemini usage limits.
 
@@ -2248,8 +2248,8 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
     $legend.FontSize = 8.5; $legend.VerticalAlignment = 'Center'
     [Windows.Controls.DockPanel]::SetDock($legend, 'Right')
     Add-Run $legend '-- ideal  ' $B.Muted 8.5 $null
-    Add-Run $legend '— actual  ' $titleBrush 8.5 $null
-    Add-Run $legend '··· fcst' $B[$sev] 8.5 $null
+    Add-Run $legend ([string][char]0x2014 + ' actual  ') $titleBrush 8.5 $null
+    Add-Run $legend '... fcst' $B[$sev] 8.5 $null
     $null = $hdr.Children.Add($legend)
 
     $title = [Windows.Controls.TextBlock]::new()
