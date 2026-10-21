@@ -55,8 +55,8 @@ At 100% (sample data): <img src="docs/limit-reached-strip.png" height="52" alt="
     - **Amber "tight":** you'd run out only shortly before the reset, or you're still under the even pace, e.g. "tight: at today's rate, out ~Sun 13:11".
   - **Limit reached:** at exactly 100%, a red **× LIMIT REACHED** label replaces the forecast warning for that window. It clears when the reset passes or a fresh reading reports less than 100%.
   - **Stale readings:** values over 15 minutes old are marked stale. Forecasts are withheld for stale readings, provider errors and Codex's session-log fallback.
-  - **One summary line per tool:** this week's tokens burned (from local logs), what they'd cost at API list prices, and how that compares with your plan, e.g. "This week 163.8M tokens ≈ $74 · 16.0× plan".
-  - **Hover over a row** for the even-pace %, the forecast ("~61% by reset"), its burn rate, the reset date, and the token breakdown (input / output / cache write / cache read).
+  - **One summary line per tool:** this week's tokens burned (from local logs), what they'd cost at API list prices, how that compares with your plan (e.g. "This week 163.8M tokens ≈ $74 · 16.0× plan"), and when a mid-window reset occurred (e.g. "· reset Wed 09:15").
+  - **Hover over a row or summary line** for the even-pace %, the forecast ("~61% by reset"), its burn rate, reset dates, and token breakdown (showing tokens burned since the last reset alongside the cumulative week total).
 - **Taskbar strip.** Six tiny signal bars sit next to the tray icons:
   - **5h** is the 5-hour window and **7d** is the weekly window. Orange labels are Claude Code, white labels are Codex, and blue labels are Gemini.
   - Red means used and grey means remaining. The white line is the even pace.

@@ -532,6 +532,71 @@ Describe 'Model prices and token accounting' {
         $sum.Unpriced | Should -Be 110
         $sum.Cost | Should -Be 0
     }
+    It 'formats since date strings cleanly for today, this week, and older dates' {
+        $now = [DateTimeOffset]::Parse('2026-10-21T12:00:00Z')
+        Format-SinceDate $null $now | Should -Be ''
+        Format-SinceDate ($now.AddHours(-3)) $now | Should -Be ('{0:HH:mm}' -f ($now.AddHours(-3)).LocalDateTime)
+        Format-SinceDate ($now.AddDays(-2)) $now | Should -Be ('{0:ddd HH:mm}' -f ($now.AddDays(-2)).LocalDateTime)
+        Format-SinceDate ($now.AddDays(-7)) $now | Should -Be ('{0:d MMM HH:mm}' -f ($now.AddDays(-7)).LocalDateTime)
+    }
+    It 'detects reset drops in history, identifies last reset time, and tracks mid-window resets' {
+        $now = [DateTimeOffset]::UtcNow
+        $resetTime = $now.AddDays(4)
+        $w = New-UsageWindow 'Weekly' 10 10080 $resetTime
+        $nominalStart = $resetTime.AddMinutes(-10080)
+
+        # Without history, uses nominal window start and scheduled reset
+        $sinceDefault = Get-WindowSince $null 'Claude Code' $w $now
+        $sinceDefault.Nominal | Should -Be $nominalStart
+        $sinceDefault.LastReset | Should -Be $nominalStart
+        $sinceDefault.IsMidWindow | Should -BeFalse
+
+        # With steady usage (no reset drop), uses nominal window start and scheduled reset
+        $steadyHistory = @(
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $now.AddDays(-2); Percent = 20.0; ResetsAt = $resetTime.ToUnixTimeSeconds() },
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $now.AddDays(-1); Percent = 40.0; ResetsAt = $resetTime.ToUnixTimeSeconds() }
+        )
+        $sinceSteady = Get-WindowSince $steadyHistory 'Claude Code' $w $now
+        $sinceSteady.Nominal | Should -Be $nominalStart
+        $sinceSteady.LastReset | Should -Be $nominalStart
+        $sinceSteady.IsMidWindow | Should -BeFalse
+
+        # With a reset drop (e.g. from 85% to 2% at 3 hours ago), detects mid-window reset timestamp
+        $resetAt = $now.AddHours(-3)
+        $resetHistory = @(
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $now.AddDays(-1); Percent = 85.0; ResetsAt = $resetTime.ToUnixTimeSeconds() },
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $resetAt; Percent = 2.0; ResetsAt = $resetTime.ToUnixTimeSeconds() },
+            [pscustomobject]@{ Tool = 'Claude Code'; Label = 'Weekly'; At = $now.AddHours(-1); Percent = 10.0; ResetsAt = $resetTime.ToUnixTimeSeconds() }
+        )
+        $sinceReset = Get-WindowSince $resetHistory 'Claude Code' $w $now
+        $sinceReset.Nominal | Should -Be $nominalStart
+        $sinceReset.LastReset | Should -Be $resetAt
+        $sinceReset.IsMidWindow | Should -BeTrue
+    }
+    It 'retains cumulative tokens while tracking tokens since last reset and reset timestamp' {
+        $now = [DateTimeOffset]::UtcNow
+        $resetTime = $now.AddDays(3)
+        $resetAt = $now.AddHours(-2)
+        $r = New-UsageResult 'Codex'
+        $r.Windows = @((New-UsageWindow 'Weekly' 5 10080 $resetTime))
+
+        $st = New-TokenState
+        $st.Files['fixture'] = @{ Entries = @(
+            [pscustomobject]@{ At = $now.AddHours(-4); Input = 500; Cached = 0; Output = 100; Total = 600; Model = 'gpt-6.1-sol' },
+            [pscustomobject]@{ At = $now.AddHours(-1); Input = 100; Cached = 0; Output = 20; Total = 120; Model = 'gpt-6.1-sol' }
+        ) }
+
+        $history = @(
+            [pscustomobject]@{ Tool = 'Codex'; Label = 'Weekly'; At = $now.AddHours(-3); Percent = 95.0; ResetsAt = $resetTime.ToUnixTimeSeconds() },
+            [pscustomobject]@{ Tool = 'Codex'; Label = 'Weekly'; At = $resetAt; Percent = 0.0; ResetsAt = $resetTime.ToUnixTimeSeconds() }
+        )
+        $tokens = Get-WindowTokens $r $st 'codex' $history
+        $tok = $tokens['Weekly']
+        $tok.Total | Should -Be 720
+        $tok.LastReset | Should -Be $resetAt
+        $tok.IsMidWindow | Should -BeTrue
+        $tok.SinceReset.Total | Should -Be 120
+    }
 }
 
 Describe 'Gemini quota and token parsing' {

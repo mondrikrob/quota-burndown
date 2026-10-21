@@ -64,7 +64,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.10.0'
+$AppVersion = '1.11.0'
 
 if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
     throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'
@@ -1243,7 +1243,7 @@ namespace QuotaBurndown {
         if ($m.Success) { [long]$m.Groups[1].Value } else { [long]0 }
     }
 
-    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0; Unpriced = [long]0 } }
+    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0; Unpriced = [long]0; Since = $null; LastReset = $null; IsMidWindow = $false; SinceReset = $null } }
 
     function Update-ClaudeTokens($State) {
         $root = Join-Path (Get-ClaudeDir) 'projects'
@@ -1303,7 +1303,7 @@ namespace QuotaBurndown {
                 if (-not $prev -or $e.Output -gt $prev.Output) { $byId[$e.Id] = $e }
             }
         }
-        $s = New-TokenSum
+        $s = New-TokenSum; $s.Since = $Since
         foreach ($e in @($byId.Values) + @($anon)) {
             $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
         }
@@ -1347,7 +1347,7 @@ namespace QuotaBurndown {
 
     function Measure-CodexTokens($State, [DateTimeOffset]$Since) {
         # Codex logs running totals per session: sum the increments inside the window.
-        $s = New-TokenSum
+        $s = New-TokenSum; $s.Since = $Since
         foreach ($st in $State.Files.Values) {
             $prev = $null
             foreach ($e in $st.Entries) {
@@ -1484,7 +1484,7 @@ namespace QuotaBurndown {
                 if (-not $prev -or ($e.Input + $e.Output + $e.CacheRead) -gt ($prev.Input + $prev.Output + $prev.CacheRead)) { $byId[$e.Id] = $e }
             }
         }
-        $s = New-TokenSum
+        $s = New-TokenSum; $s.Since = $Since
         foreach ($e in @($byId.Values) + @($anon)) {
             $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
         }
@@ -1492,8 +1492,35 @@ namespace QuotaBurndown {
         $s
     }
 
+    function Get-WindowSince($History, [string]$Tool, $w, [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow) {
+        if (-not $w) { return [pscustomobject]@{ Nominal = $Now.AddMinutes(-10080); LastReset = $Now.AddMinutes(-10080); IsMidWindow = $false } }
+        $mins = if ($w.Minutes -gt 0) { $w.Minutes } else { 10080 }
+        $nominal = if ($w.ResetsAt -and $w.ResetsAt -gt $Now) { $w.ResetsAt.AddMinutes(-$mins) } else { $Now.AddMinutes(-$mins) }
+        $lastReset = $nominal
+        $isMidWindow = $false
+        if ($History -and $w.ResetsAt) {
+            $reset = $w.ResetsAt.ToUnixTimeSeconds()
+            $pts = @($History | Where-Object {
+                $_.Tool -eq $Tool -and $_.Label -eq $w.Label -and [Math]::Abs($_.ResetsAt - $reset) -le 120 -and $_.At -ge $nominal
+            } | Sort-Object At)
+            if ($pts.Count -ge 2) {
+                for ($i = $pts.Count - 1; $i -ge 1; $i--) {
+                    $prev = $pts[$i - 1]; $curr = $pts[$i]
+                    if (($prev.Percent - $curr.Percent) -ge 5.0 -or ($curr.Percent -le 1.0 -and $prev.Percent -ge 3.0)) {
+                        if ($curr.At -gt $nominal) {
+                            $lastReset = $curr.At
+                            $isMidWindow = $true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        [pscustomobject]@{ Nominal = $nominal; LastReset = $lastReset; IsMidWindow = $isMidWindow }
+    }
+
     # Token sums per usage window, keyed by window label ('5-hour', 'Weekly', ...).
-    function Get-WindowTokens($Result, $State, [string]$Kind) {
+    function Get-WindowTokens($Result, $State, [string]$Kind, $History = $null) {
         $now = [DateTimeOffset]::UtcNow
         $wins = @($Result.Windows)
         if ($wins.Count -eq 0) {
@@ -1506,22 +1533,42 @@ namespace QuotaBurndown {
             # A scoped Claude quota does not represent all locally logged models.
             # Omit its token total until we can attribute entries to that scope.
             if ($Kind -eq 'claude' -and $w.Label -like 'Weekly *') { continue }
-            $since = if ($w.ResetsAt -and $w.ResetsAt -gt $now) { $w.ResetsAt.AddMinutes(-$w.Minutes) } else { $now.AddMinutes(-$w.Minutes) }
+            $info = Get-WindowSince $History $Result.Name $w $now
             $filter = ''
             if ($Kind -eq 'gemini') {
                 if ($w.Label -match ([char]0x00B7 + '\s*(.+)$')) { $filter = $Matches[1].Trim() }
                 elseif ($w.Label -eq 'Weekly' -and $hasArgonScoped) { $filter = '!Argon' }
             }
-            $out[$w.Label] = switch ($Kind) {
-                'claude' { Measure-ClaudeTokens $State $since }
-                'gemini' { Measure-GeminiTokens $State $since $filter }
-                default  { Measure-CodexTokens $State $since }
+            $tok = switch ($Kind) {
+                'claude' { Measure-ClaudeTokens $State $info.Nominal }
+                'gemini' { Measure-GeminiTokens $State $info.Nominal $filter }
+                default  { Measure-CodexTokens $State $info.Nominal }
             }
+            $tok.Since = $info.Nominal; $tok.LastReset = $info.LastReset; $tok.IsMidWindow = $info.IsMidWindow
+            if ($info.IsMidWindow) {
+                $sr = switch ($Kind) {
+                    'claude' { Measure-ClaudeTokens $State $info.LastReset }
+                    'gemini' { Measure-GeminiTokens $State $info.LastReset $filter }
+                    default  { Measure-CodexTokens $State $info.LastReset }
+                }
+                $sr.Since = $info.LastReset; $tok.SinceReset = $sr
+            } else {
+                $tok.SinceReset = $tok
+            }
+            $out[$w.Label] = $tok
         }
         if ($Kind -eq 'gemini' -and $hasArgonScoped) {
             $weeklyWindow = $wins | Where-Object { $_.Label -eq 'Weekly' -or $_.Minutes -eq 10080 } | Select-Object -First 1
-            $wSince = if ($weeklyWindow -and $weeklyWindow.ResetsAt -and $weeklyWindow.ResetsAt -gt $now) { $weeklyWindow.ResetsAt.AddMinutes(-$weeklyWindow.Minutes) } else { $now.AddMinutes(-10080) }
-            $out['WeeklyAll'] = Measure-GeminiTokens $State $wSince ''
+            $wInfo = if ($weeklyWindow) { Get-WindowSince $History $Result.Name $weeklyWindow $now } else { [pscustomobject]@{ Nominal = $now.AddMinutes(-10080); LastReset = $now.AddMinutes(-10080); IsMidWindow = $false } }
+            $tokAll = Measure-GeminiTokens $State $wInfo.Nominal ''
+            $tokAll.Since = $wInfo.Nominal; $tokAll.LastReset = $wInfo.LastReset; $tokAll.IsMidWindow = $wInfo.IsMidWindow
+            if ($wInfo.IsMidWindow) {
+                $srAll = Measure-GeminiTokens $State $wInfo.LastReset ''
+                $srAll.Since = $wInfo.LastReset; $tokAll.SinceReset = $srAll
+            } else {
+                $tokAll.SinceReset = $tokAll
+            }
+            $out['WeeklyAll'] = $tokAll
         }
         $out
     }
@@ -1726,6 +1773,22 @@ namespace QuotaBurndown {
         if ($s.TotalDays -lt 1) { return '{0}h {1}m' -f [int][Math]::Floor($s.TotalHours), $s.Minutes }
         '{0}d {1}h' -f [int][Math]::Floor($s.TotalDays), $s.Hours
     }
+
+    function Format-SinceDate($Dto, [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow) {
+        if (-not $Dto) { return '' }
+        $dtoDto = [DateTimeOffset]$Dto
+        $local = $dtoDto.LocalDateTime
+        $nowLocal = $Now.LocalDateTime
+        $span = $nowLocal - $local
+        $days = ($nowLocal.Date - $local.Date).TotalDays
+        if ($days -eq 0 -and $span.TotalHours -lt 24) {
+            return '{0:HH:mm}' -f $local
+        }
+        if ($days -ge 1 -and $span.TotalDays -lt 6) {
+            return '{0:ddd HH:mm}' -f $local
+        }
+        return '{0:d MMM HH:mm}' -f $local
+    }
 }
 
 . $DataLayer
@@ -1821,7 +1884,7 @@ if ($Once) {
             'gemini' { Update-GeminiTokens $st }
             default  { Update-CodexTokens $st }
         }
-        $tokens = Get-WindowTokens $r $st $kind
+        $tokens = Get-WindowTokens $r $st $kind $history
         $forecasts = Get-Forecasts $history $r
         $hdr = $r.Name + $(if ($r.Plan) { " ($($r.Plan))" }) + $(if ($r.Source) { " [$($r.Source)]" }) + $(if ($r.Error) { " ERROR: $($r.Error)" })
         Write-Output $hdr
@@ -2057,9 +2120,9 @@ $WorkerLoop = {
                 Update-CodexTokens $tokCodex
                 Update-GeminiTokens $tokGemini
                 $sync.Tokens = @{
-                    'Claude Code' = (Get-WindowTokens $sync.Claude $tokClaude 'claude')
-                    'Codex'       = (Get-WindowTokens $sync.Codex $tokCodex 'codex')
-                    'Gemini'      = (Get-WindowTokens $sync.Gemini $tokGemini 'gemini')
+                    'Claude Code' = (Get-WindowTokens $sync.Claude $tokClaude 'claude' $history)
+                    'Codex'       = (Get-WindowTokens $sync.Codex $tokCodex 'codex' $history)
+                    'Gemini'      = (Get-WindowTokens $sync.Gemini $tokGemini 'gemini' $history)
                 }
                 $cut = [DateTimeOffset]::UtcNow.AddDays(-8)
                 if ($history.Count -and $history[0].At -lt $cut) {
@@ -2438,6 +2501,17 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
     $tokStr = if ($tok -and $tok.Total -gt 0) { (Format-Tokens $tok.Total) + ' tok' } else { '0 tok' }
     $tTok = New-Text $tokStr $B.Muted 9
     $tTok.HorizontalAlignment = 'Right'
+    if ($tok) {
+        $tTip = @()
+        if ($tok.LastReset) { $tTip += 'Last reset: {0:ddd HH:mm}' -f $tok.LastReset.LocalDateTime }
+        if ($tok.IsMidWindow -and $tok.SinceReset) {
+            $tTip += 'Since last reset: {0} tokens (~{1})' -f (Format-Tokens $tok.SinceReset.Total), (Format-Usd $tok.SinceReset.Cost)
+            $tTip += 'Total window: {0} tokens (~{1})' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
+        } else {
+            $tTip += 'Window tokens: {0} (~{1})' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
+        }
+        $tTok.ToolTip = $tTip -join "`n"
+    }
     [Windows.Controls.Grid]::SetColumn($tTok, 2)
     $null = $grid.Children.Add($tTok)
 
@@ -2594,7 +2668,16 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now, $TitleBrush = $null) {
     $tok = Get-Derived 'Tokens' $r.Name $w.Label
     if ($tok) {
         $tip += ''
-        $tip += 'Tokens burned on this PC in this window: {0} (~{1} at API prices)' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
+        if ($tok.LastReset) {
+            $resetKind = if ($tok.IsMidWindow) { 'manual / banked reset' } else { 'scheduled' }
+            $tip += 'Last reset: {0:ddd d MMM HH:mm} ({1})' -f $tok.LastReset.LocalDateTime, $resetKind
+        }
+        if ($tok.IsMidWindow -and $tok.SinceReset) {
+            $tip += 'Tokens burned since last reset: {0} (~{1} at API prices)' -f (Format-Tokens $tok.SinceReset.Total), (Format-Usd $tok.SinceReset.Cost)
+            $tip += 'Total tokens in this window: {0} (~{1} at API prices)' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
+        } else {
+            $tip += 'Tokens burned on this PC in this window: {0} (~{1} at API prices)' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
+        }
         $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $tok.Input), (Format-Tokens $tok.Output), (Format-Tokens $tok.CacheWrite), (Format-Tokens $tok.CacheRead)
         if ($tok.Unpriced -gt 0) { $tip += (Format-Tokens $tok.Unpriced) + ' tokens have no known model price. The dollar amount is only the priced subtotal.' }
     }
@@ -2666,14 +2749,32 @@ function Add-ProviderSection($r, [bool]$First) {
         Add-Run $v (' tokens ' + $Sym.Approx + ' ') $B.Muted 11 $null
         Add-Run $v (Format-UsdShort $week.Cost) $B.Text 11 ([Windows.FontWeights]::SemiBold)
         if ($week.Unpriced -gt 0) { Add-Run $v ' priced subtotal' $B.Warn 11 $null }
-        $tip = @("What the tokens {0} burned on this PC in the current weekly window would cost at API list prices: {1}." -f $r.Name, (Format-Usd $week.Cost))
-        $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $week.Input), (Format-Tokens $week.Output), (Format-Tokens $week.CacheWrite), (Format-Tokens $week.CacheRead)
         if ($plan -and $week.Unpriced -eq 0) {
             $weekly = $plan * 12 / 52
             $ratio = $week.Cost / $weekly
             Add-Run $v (' ' + $Sym.Dot + ' ') $B.Muted 11 $null
             Add-Run $v ('{0:0.0}{1} plan' -f $ratio, $Sym.Times) $B[$(if ($ratio -ge 1) { 'Ok' } else { 'Muted' })] 11 $null
-            $tip += 'Your plan: {0}/month = {1}/week, so this is {2:0.0}{3} its price.' -f (Format-Usd $plan), (Format-Usd $weekly), $ratio, $Sym.Times
+        }
+        if ($week.IsMidWindow -and $week.LastReset) {
+            Add-Run $v (' ' + $Sym.Dot + ' ') $B.Muted 11 $null
+            Add-Run $v ('reset ' + (Format-SinceDate $week.LastReset $now)) $B.Muted 11 $null
+        }
+        $tip = @()
+        if ($week.LastReset) {
+            $resetKind = if ($week.IsMidWindow) { 'manual / banked reset' } else { 'scheduled rollover' }
+            $tip += 'Last reset: {0:ddd d MMM HH:mm} ({1})' -f $week.LastReset.LocalDateTime, $resetKind
+        }
+        if ($week.IsMidWindow -and $week.SinceReset) {
+            $tip += 'Tokens burned since last reset: {0} (~{1} at API prices)' -f (Format-Tokens $week.SinceReset.Total), (Format-Usd $week.SinceReset.Cost)
+            $tip += 'Total tokens burned this week: {0} (~{1} at API prices)' -f (Format-Tokens $week.Total), (Format-Usd $week.Cost)
+        } else {
+            $tip += 'Tokens burned on this PC in the current weekly window: {0} (~{1} at API prices)' -f (Format-Tokens $week.Total), (Format-Usd $week.Cost)
+        }
+        $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $week.Input), (Format-Tokens $week.Output), (Format-Tokens $week.CacheWrite), (Format-Tokens $week.CacheRead)
+        if ($plan -and $week.Unpriced -eq 0) {
+            $weekly = $plan * 12 / 52
+            $ratio = $week.Cost / $weekly
+            $tip += 'Your plan: {0}/month = {1}/week, so this week represents {2:0.0}{3} its price.' -f (Format-Usd $plan), (Format-Usd $weekly), $ratio, $Sym.Times
         } elseif (-not $plan) {
             $settingPrefix = switch ($r.Name) { 'Claude Code' { 'Claude' } 'Gemini' { 'Gemini' } default { 'Codex' } }
             $tip += 'Set {0}PlanUsdPerMonth in settings.json to compare with your plan.' -f $settingPrefix
@@ -3268,13 +3369,12 @@ if ($Snapshot) {
     $sync.Codex = (Update-Codex $Settings.CodexRefreshMinutes).Result
     $sync.Gemini = (Update-Gemini $Settings.GeminiRefreshMinutes).Result
     $tc = New-TokenState; $tx = New-TokenState; $tg = New-TokenState
-    Update-ClaudeTokens $tc; Update-CodexTokens $tx; Update-GeminiTokens $tg
+    Update-ClaudeTokens $tc; Update-CodexTokens $tx; Update-GeminiTokens $tg; $hist = Import-UsageHistory
     $sync.Tokens = @{
-        'Claude Code' = (Get-WindowTokens $sync.Claude $tc 'claude')
-        'Codex'       = (Get-WindowTokens $sync.Codex $tx 'codex')
-        'Gemini'      = (Get-WindowTokens $sync.Gemini $tg 'gemini')
+        'Claude Code' = (Get-WindowTokens $sync.Claude $tc 'claude' $hist)
+        'Codex'       = (Get-WindowTokens $sync.Codex $tx 'codex' $hist)
+        'Gemini'      = (Get-WindowTokens $sync.Gemini $tg 'gemini' $hist)
     }
-    $hist = Import-UsageHistory
     $sync.Forecast = @{
         'Claude Code' = (Get-Forecasts $hist $sync.Claude)
         'Codex'       = (Get-Forecasts $hist $sync.Codex)
