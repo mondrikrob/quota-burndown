@@ -436,10 +436,11 @@ namespace QuotaBurndown {
     }
 
     function Find-ClaudeExe {
+        if ($script:cachedClaudeExe -and (Test-Path $script:cachedClaudeExe)) { return $script:cachedClaudeExe }
         $cmd = Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cmd) { return $cmd.Source }
+        if ($cmd) { $script:cachedClaudeExe = $cmd.Source; return $cmd.Source }
         $native = Join-Path $HOME '.local\bin\claude.exe'   # the native installer's default location
-        if (Test-Path $native) { return $native }
+        if (Test-Path $native) { $script:cachedClaudeExe = $native; return $native }
         $null
     }
 
@@ -620,14 +621,15 @@ namespace QuotaBurndown {
     function Get-CodexHome { if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' } }
 
     function Find-CodexExe {
+        if ($script:cachedCodexExe -and (Test-Path $script:cachedCodexExe)) { return $script:cachedCodexExe }
         $cmd = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cmd) { return $cmd.Source }
+        if ($cmd) { $script:cachedCodexExe = $cmd.Source; return $cmd.Source }
         # The Codex desktop app ships the CLI in a content-hashed folder that changes on update.
         $appBin = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin'
         if (Test-Path $appBin) {
             $exe = Get-ChildItem $appBin -Filter codex.exe -Recurse -Depth 1 -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($exe) { return $exe.FullName }
+            if ($exe) { $script:cachedCodexExe = $exe.FullName; return $exe.FullName }
         }
         # npm global install: prefer the native binary over the .cmd shim.
         $shim = Get-Command codex.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -638,8 +640,9 @@ namespace QuotaBurndown {
             foreach ($c in @(
                     (Join-Path $root "node_modules\@openai\codex\node_modules\@openai\codex-win32-$arch\vendor\$triple\bin\codex.exe"),
                     (Join-Path $root "node_modules\@openai\codex\vendor\$triple\bin\codex.exe"))) {
-                if (Test-Path $c) { return $c }
+                if (Test-Path $c) { $script:cachedCodexExe = $c; return $c }
             }
+            $script:cachedCodexExe = $shim.Source
             return $shim.Source
         }
         $null
@@ -1025,6 +1028,17 @@ namespace QuotaBurndown {
     }
 
     function Get-GeminiLive {
+        if ($script:geminiEndpoint) {
+            $ep = $script:geminiEndpoint
+            $statusRes = Invoke-AntigravityRpc $ep.Port $ep.Csrf 'GetUserStatus' $ep.Scheme
+            $summaryRes = if ($statusRes) { Invoke-AntigravityRpc $ep.Port $ep.Csrf 'RetrieveUserQuotaSummary' $ep.Scheme } else { $null }
+            $statusObj = if ($statusRes) { $statusRes.Payload } else { $null }
+            $summaryObj = if ($summaryRes) { $summaryRes.Payload } else { $null }
+            if ($statusObj -or $summaryObj) {
+                try { return (ConvertFrom-GeminiPayload $statusObj $summaryObj) } catch { }
+            }
+            $script:geminiEndpoint = $null
+        }
         $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'language_server%'" -ErrorAction SilentlyContinue)
         if ($procs.Count -eq 0) { throw 'Antigravity language server is not running' }
         $lastErr = 'Antigravity language server port not found'
@@ -1042,8 +1056,11 @@ namespace QuotaBurndown {
                 $statusObj = if ($statusRes) { $statusRes.Payload } else { $null }
                 $summaryObj = if ($summaryRes) { $summaryRes.Payload } else { $null }
                 if ($statusObj -or $summaryObj) {
-                    try { return (ConvertFrom-GeminiPayload $statusObj $summaryObj) }
-                    catch { $lastErr = $_.Exception.Message }
+                    try {
+                        $parsed = ConvertFrom-GeminiPayload $statusObj $summaryObj
+                        $script:geminiEndpoint = @{ Port = $port; Csrf = $csrf; Scheme = $(if ($summaryRes) { $summaryRes.Scheme } else { $scheme }) }
+                        return $parsed
+                    } catch { $lastErr = $_.Exception.Message }
                 }
             }
         }
@@ -1144,55 +1161,93 @@ namespace QuotaBurndown {
     #          https://ai.google.dev/gemini-api/docs/pricing
 
     function Get-ClaudePrice([string]$Model) {
-        # model prefix, input, output, 5-minute cache write, 1-hour cache write, cache read
-        $table = @(
-            @('claude-fable-5-1', 10, 50, 12.5, 20, 0.25), @('claude-mythos-5-1', 10, 50, 12.5, 20, 0.25),
-            @('claude-fable-5', 10, 50, 12.5, 20, 1.0), @('claude-mythos-5', 10, 50, 12.5, 20, 1.0),
-            @('claude-opus-5-5', 4, 20, 5, 8, 0.20), @('claude-opus-5', 5, 25, 6.25, 10, 0.50),
-            @('claude-opus-4-1', 15, 75, 18.75, 30, 1.50), @('claude-opus-4-2025', 15, 75, 18.75, 30, 1.50),
-            @('claude-opus-4-8', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-7', 5, 25, 6.25, 10, 0.50),
-            @('claude-opus-4-6', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-5', 5, 25, 6.25, 10, 0.50),
-            @('claude-opus-4', 15, 75, 18.75, 30, 1.50),
-            @('claude-sonnet-5-5', 2, 10, 2.5, 4, 0.10), @('claude-sonnet-5', 2, 10, 2.5, 4, 0.20),
-            @('claude-sonnet-4-6', 3, 15, 3.75, 6, 0.30), @('claude-sonnet-4-5', 3, 15, 3.75, 6, 0.30),
-            @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30),
-            @('claude-haiku-5-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-5', 1, 5, 1.25, 2, 0.10),
-            @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
-        )
-        foreach ($row in $table) {
-            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{8}$')) { return , $row }
+        if (-not $Model) { return $null }
+        if (-not $script:claudePriceCache) { $script:claudePriceCache = @{} }
+        if ($script:claudePriceCache.ContainsKey($Model)) {
+            $c = $script:claudePriceCache[$Model]
+            if ($null -ne $c) { return , $c }
+            return $null
         }
+        if (-not $script:claudePriceTable) {
+            # model prefix, input, output, 5-minute cache write, 1-hour cache write, cache read
+            $script:claudePriceTable = @(
+                @('claude-fable-5-1', 10, 50, 12.5, 20, 0.25), @('claude-mythos-5-1', 10, 50, 12.5, 20, 0.25),
+                @('claude-fable-5', 10, 50, 12.5, 20, 1.0), @('claude-mythos-5', 10, 50, 12.5, 20, 1.0),
+                @('claude-opus-5-5', 4, 20, 5, 8, 0.20), @('claude-opus-5', 5, 25, 6.25, 10, 0.50),
+                @('claude-opus-4-1', 15, 75, 18.75, 30, 1.50), @('claude-opus-4-2025', 15, 75, 18.75, 30, 1.50),
+                @('claude-opus-4-8', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-7', 5, 25, 6.25, 10, 0.50),
+                @('claude-opus-4-6', 5, 25, 6.25, 10, 0.50), @('claude-opus-4-5', 5, 25, 6.25, 10, 0.50),
+                @('claude-opus-4', 15, 75, 18.75, 30, 1.50),
+                @('claude-sonnet-5-5', 2, 10, 2.5, 4, 0.10), @('claude-sonnet-5', 2, 10, 2.5, 4, 0.20),
+                @('claude-sonnet-4-6', 3, 15, 3.75, 6, 0.30), @('claude-sonnet-4-5', 3, 15, 3.75, 6, 0.30),
+                @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30),
+                @('claude-haiku-5-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-5', 1, 5, 1.25, 2, 0.10),
+                @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
+            )
+        }
+        foreach ($row in $script:claudePriceTable) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{8}$')) {
+                $script:claudePriceCache[$Model] = $row
+                return , $row
+            }
+        }
+        $script:claudePriceCache[$Model] = $null
         $null   # do not invent a price for unknown models or variants
     }
 
     function Get-CodexPrice([string]$Model) {
-        # model prefix, input, cached input, output
-        $table = @(
-            @('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30),
-            @('codex-auto-review', 0, 0, 0)
-        )
-        foreach ($row in $table) {
-            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{4}-\d{2}-\d{2}$')) { return , $row }
+        if (-not $Model) { return $null }
+        if (-not $script:codexPriceCache) { $script:codexPriceCache = @{} }
+        if ($script:codexPriceCache.ContainsKey($Model)) {
+            $c = $script:codexPriceCache[$Model]
+            if ($null -ne $c) { return , $c }
+            return $null
         }
+        if (-not $script:codexPriceTable) {
+            # model prefix, input, cached input, output
+            $script:codexPriceTable = @(
+                @('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30),
+                @('codex-auto-review', 0, 0, 0)
+            )
+        }
+        foreach ($row in $script:codexPriceTable) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{4}-\d{2}-\d{2}$')) {
+                $script:codexPriceCache[$Model] = $row
+                return , $row
+            }
+        }
+        $script:codexPriceCache[$Model] = $null
         $null
     }
 
     function Get-GeminiPrice([string]$Model) {
         if (-not $Model) { return $null }
+        if (-not $script:geminiPriceCache) { $script:geminiPriceCache = @{} }
+        if ($script:geminiPriceCache.ContainsKey($Model)) {
+            $c = $script:geminiPriceCache[$Model]
+            if ($null -ne $c) { return , $c }
+            return $null
+        }
         $norm = (($Model.ToLowerInvariant() -replace '\s*\((high|medium|low|max)\)\s*$', '') -replace '[\s_]+', '-').Trim('-')
         $norm = $norm -replace '-(high|medium|low|max|preview|exp|latest|windsurf)$', ''
-        # model prefix, input, cached input, output
-        $table = @(
-            @('gemini-4-argon', 2.0, 0.10, 10.0), @('gemini-4-pro', 2.0, 0.10, 10.0),
-            @('gemini-3.8-flash', 0.75, 0.075, 3.75), @('gemini-3.7-flash', 0.75, 0.075, 3.75), @('gemini-3.6-flash', 0.75, 0.075, 3.75),
-            @('gemini-3.5-flash-lite', 0.30, 0.03, 2.50), @('gemini-3.5-flash', 1.50, 0.15, 9.0),
-            @('gemini-3.1-pro', 2.0, 0.20, 12.0), @('gemini-3-pro', 2.0, 0.20, 12.0),
-            @('gemini-3.1-flash-lite', 0.25, 0.025, 1.50), @('gemini-3-flash', 0.50, 0.05, 3.0),
-            @('gemini-2.5-pro', 1.25, 0.125, 10.0), @('gemini-2.5-flash-lite', 0.10, 0.01, 0.40), @('gemini-2.5-flash', 0.30, 0.03, 2.50)
-        )
-        foreach ($row in $table) {
-            if ($norm -eq $row[0] -or $norm -match ('^' + [regex]::Escape($row[0]) + '-\d{2,4}(-\d{2})?(-\d{2})?$')) { return , $row }
+        if (-not $script:geminiPriceTable) {
+            # model prefix, input, cached input, output
+            $script:geminiPriceTable = @(
+                @('gemini-4-argon', 2.0, 0.10, 10.0), @('gemini-4-pro', 2.0, 0.10, 10.0),
+                @('gemini-3.8-flash', 0.75, 0.075, 3.75), @('gemini-3.7-flash', 0.75, 0.075, 3.75), @('gemini-3.6-flash', 0.75, 0.075, 3.75),
+                @('gemini-3.5-flash-lite', 0.30, 0.03, 2.50), @('gemini-3.5-flash', 1.50, 0.15, 9.0),
+                @('gemini-3.1-pro', 2.0, 0.20, 12.0), @('gemini-3-pro', 2.0, 0.20, 12.0),
+                @('gemini-3.1-flash-lite', 0.25, 0.025, 1.50), @('gemini-3-flash', 0.50, 0.05, 3.0),
+                @('gemini-2.5-pro', 1.25, 0.125, 10.0), @('gemini-2.5-flash-lite', 0.10, 0.01, 0.40), @('gemini-2.5-flash', 0.30, 0.03, 2.50)
+            )
         }
+        foreach ($row in $script:geminiPriceTable) {
+            if ($norm -eq $row[0] -or $norm -match ('^' + [regex]::Escape($row[0]) + '-\d{2,4}(-\d{2})?(-\d{2})?$')) {
+                $script:geminiPriceCache[$Model] = $row
+                return , $row
+            }
+        }
+        $script:geminiPriceCache[$Model] = $null
         $null
     }
 
@@ -1216,6 +1271,9 @@ namespace QuotaBurndown {
     function Read-NewLines($Files, [string]$Path) {
         $st = $Files[$Path]
         if (-not $st) { $st = @{ Offset = [long]0; Model = ''; SkippingLine = $false; Entries = New-Object System.Collections.ArrayList }; $Files[$Path] = $st }
+        if ($st.Offset -gt 0 -and -not $st.SkippingLine) {
+            try { if ([IO.FileInfo]::new($Path).Length -eq $st.Offset) { return } } catch { }
+        }
         $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
         try {
             if ($fs.Length -lt $st.Offset) { $st.Offset = [long]0; $st.Model = ''; $st.SkippingLine = $false; $st.Entries.Clear() }   # file was rewritten
@@ -1304,7 +1362,10 @@ namespace QuotaBurndown {
             }
         }
         $s = New-TokenSum; $s.Since = $Since
-        foreach ($e in @($byId.Values) + @($anon)) {
+        foreach ($e in $byId.Values) {
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+        }
+        foreach ($e in $anon) {
             $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
         }
         $s.Total = $s.Input + $s.Output + $s.CacheWrite + $s.CacheRead
@@ -1312,12 +1373,16 @@ namespace QuotaBurndown {
     }
 
     function Update-CodexTokens($State) {
-        $files = @(Get-CodexSessionFiles 9)
-        $live = @{}
-        foreach ($f in $files) {
-            $live[$f.FullName] = $true
-            try { $lines = Read-NewLines $State.Files $f.FullName } catch { continue }
-            $st = $State.Files[$f.FullName]
+        if (([DateTime]::UtcNow - $State.ListedAt).TotalMinutes -ge 5 -or -not $State.List) {
+            $State.List = @(Get-CodexSessionFiles 9 | ForEach-Object { $_.FullName })
+            $State.ListedAt = [DateTime]::UtcNow
+            $live = @{}
+            foreach ($p in $State.List) { $live[$p] = $true }
+            foreach ($k in @($State.Files.Keys)) { if (-not $live[$k]) { $State.Files.Remove($k) } }
+        }
+        foreach ($path in $State.List) {
+            try { $lines = Read-NewLines $State.Files $path } catch { continue }
+            $st = $State.Files[$path]
             foreach ($l in $lines) {
                 if ($l.Contains('"type":"turn_context"')) {
                     $m = [regex]::Match($l, '"model":"([^"]+)"')
@@ -1342,7 +1407,6 @@ namespace QuotaBurndown {
                     })
             }
         }
-        foreach ($k in @($State.Files.Keys)) { if (-not $live[$k]) { $State.Files.Remove($k) } }
     }
 
     function Measure-CodexTokens($State, [DateTimeOffset]$Since) {
@@ -1430,8 +1494,13 @@ namespace QuotaBurndown {
                 foreach ($l in $lines) {
                     if (-not $l.Trim()) { continue }
                     $cid = [regex]::Match($l, '"conversation_id":"([^"]+)"')
-                    if ($cid.Success -and @($State.List | Where-Object { $_ -like ('*' + $cid.Groups[1].Value + '*') }).Count -gt 0) {
-                        continue
+                    if ($cid.Success -and $State.List.Count -gt 0) {
+                        $cidVal = $cid.Groups[1].Value
+                        $dup = $false
+                        foreach ($p in $State.List) {
+                            if ($p.IndexOf($cidVal, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $dup = $true; break }
+                        }
+                        if ($dup) { continue }
                     }
                     $ts = [regex]::Match($l, '"timestamp":"([^"]+)"')
                     if (-not $ts.Success) { continue }
@@ -1468,16 +1537,20 @@ namespace QuotaBurndown {
 
     function Measure-GeminiTokens($State, [DateTimeOffset]$Since, [string]$ModelFilter = '') {
         $byId = @{}; $anon = New-Object System.Collections.ArrayList
+        $hasFilter = [bool]$ModelFilter
+        $negate = $false
+        $pattern = ''
+        if ($hasFilter) {
+            if ($ModelFilter.StartsWith('!')) { $negate = $true; $pattern = $ModelFilter.Substring(1) }
+            else { $pattern = $ModelFilter }
+        }
         foreach ($st in $State.Files.Values) {
             foreach ($e in $st.Entries) {
                 if ($e.At -lt $Since) { continue }
-                if ($ModelFilter) {
-                    if ($ModelFilter.StartsWith('!')) {
-                        $neg = $ModelFilter.Substring(1)
-                        if (([string]$e.Model) -match [regex]::Escape($neg)) { continue }
-                    } else {
-                        if (([string]$e.Model) -notmatch [regex]::Escape($ModelFilter)) { continue }
-                    }
+                if ($hasFilter) {
+                    $matched = ([string]$e.Model).IndexOf($pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                    if ($negate) { if ($matched) { continue } }
+                    else { if (-not $matched) { continue } }
                 }
                 if (-not $e.Id) { $null = $anon.Add($e); continue }
                 $prev = $byId[$e.Id]
@@ -1485,7 +1558,10 @@ namespace QuotaBurndown {
             }
         }
         $s = New-TokenSum; $s.Since = $Since
-        foreach ($e in @($byId.Values) + @($anon)) {
+        foreach ($e in $byId.Values) {
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+        }
+        foreach ($e in $anon) {
             $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
         }
         $s.Total = $s.Input + $s.Output + $s.CacheRead
@@ -1500,9 +1576,16 @@ namespace QuotaBurndown {
         $isMidWindow = $false
         if ($History -and $w.ResetsAt) {
             $reset = $w.ResetsAt.ToUnixTimeSeconds()
-            $pts = @($History | Where-Object {
-                $_.Tool -eq $Tool -and $_.Label -eq $w.Label -and [Math]::Abs($_.ResetsAt - $reset) -le 120 -and $_.At -ge $nominal
-            } | Sort-Object At)
+            $pts = [Collections.Generic.List[object]]::new()
+            $outOfOrder = $false; $lastAt = [DateTimeOffset]::MinValue
+            foreach ($h in $History) {
+                if ($h.Tool -eq $Tool -and $h.Label -eq $w.Label -and [Math]::Abs($h.ResetsAt - $reset) -le 120 -and $h.At -ge $nominal) {
+                    if ($h.At -lt $lastAt) { $outOfOrder = $true }
+                    $lastAt = $h.At
+                    $pts.Add($h)
+                }
+            }
+            if ($outOfOrder) { $pts = @($pts | Sort-Object At) }
             if ($pts.Count -ge 2) {
                 for ($i = $pts.Count - 1; $i -ge 1; $i--) {
                     $prev = $pts[$i - 1]; $curr = $pts[$i]
@@ -1640,10 +1723,18 @@ namespace QuotaBurndown {
         $reset = $w.ResetsAt.ToUnixTimeSeconds()
         $short = $w.Minutes -le 300
         $lookback = if ($short) { 60 } else { 1440 }
-        $pts = @($History | Where-Object {
-                $_.Tool -eq $Tool -and $_.Label -eq $w.Label -and [Math]::Abs($_.ResetsAt - $reset) -le 120 -and $_.At -ge $now.AddMinutes(-$lookback)
-            } | Sort-Object At)
-        if ($UpdatedAt) { $pts += [pscustomobject]@{ At = $UpdatedAt; Percent = $w.Percent } }
+        $cutAt = $now.AddMinutes(-$lookback)
+        $pts = [Collections.Generic.List[object]]::new()
+        $outOfOrder = $false; $lastAt = [DateTimeOffset]::MinValue
+        foreach ($h in $History) {
+            if ($h.Tool -eq $Tool -and $h.Label -eq $w.Label -and [Math]::Abs($h.ResetsAt - $reset) -le 120 -and $h.At -ge $cutAt) {
+                if ($h.At -lt $lastAt) { $outOfOrder = $true }
+                $lastAt = $h.At
+                $pts.Add($h)
+            }
+        }
+        if ($outOfOrder) { $pts = [Collections.Generic.List[object]]::new([object[]]@($pts | Sort-Object At)) }
+        if ($UpdatedAt) { $pts.Add([pscustomobject]@{ At = $UpdatedAt; Percent = $w.Percent }) }
         $rate = $null; $method = 'recent'
         if ($pts.Count -ge 2) {
             $span = ($pts[-1].At - $pts[0].At).TotalMinutes
@@ -1688,9 +1779,17 @@ namespace QuotaBurndown {
         if (-not $w.ResetsAt) { return @() }
         $reset = $w.ResetsAt.ToUnixTimeSeconds()
         $start = $w.ResetsAt.AddMinutes(-$w.Minutes)
-        @($History | Where-Object {
-            $_.Tool -eq $Tool -and $_.Label -eq $w.Label -and [Math]::Abs($_.ResetsAt - $reset) -le 120 -and $_.At -ge $start
-        } | Sort-Object At)
+        $pts = [Collections.Generic.List[object]]::new()
+        $outOfOrder = $false; $lastAt = [DateTimeOffset]::MinValue
+        foreach ($h in $History) {
+            if ($h.Tool -eq $Tool -and $h.Label -eq $w.Label -and [Math]::Abs($h.ResetsAt - $reset) -le 120 -and $h.At -ge $start) {
+                if ($h.At -lt $lastAt) { $outOfOrder = $true }
+                $lastAt = $h.At
+                $pts.Add($h)
+            }
+        }
+        if ($outOfOrder) { return , @($pts | Sort-Object At) }
+        , $pts.ToArray()
     }
 
     function Get-ToolHistoryMap($History, $Result) {
@@ -2294,6 +2393,9 @@ $null = $topButtons.Children.Add((New-IconButton $Glyph.Minimize 'Minimize to th
 function Format-UsdShort([double]$n) { if ($n -ge 10) { '$' + [Math]::Round($n).ToString('#,0', [Globalization.CultureInfo]::InvariantCulture) } else { Format-Usd $n } }
 
 $script:expandedWindows = @{}
+$DashGrid = [Windows.Media.DoubleCollection]::Parse('2,2'); $DashGrid.Freeze()
+$DashIdeal = [Windows.Media.DoubleCollection]::Parse('3,2'); $DashIdeal.Freeze()
+$WhiteBrush = New-Brush '#FFFFFFFF'
 
 function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBrush) {
     if (-not $w.ResetsAt -or $w.Minutes -le 0) { return $null }
@@ -2329,7 +2431,6 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
     $yTop = 6.0; $yBottom = 52.0; $plotH = $yBottom - $yTop
 
     # Grid lines & Y labels: 100%, 50%, 0%
-    $gridDash = [Windows.Media.DoubleCollection]::Parse('2,2')
     foreach ($lvl in @(
         @{ Y = $yTop; Label = '100%'; YText = 0 },
         @{ Y = ($yTop + $yBottom) / 2.0; Label = '50%'; YText = (($yTop + $yBottom) / 2.0) - 6 },
@@ -2337,7 +2438,7 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
     )) {
         $gl = [Windows.Shapes.Line]::new()
         $gl.X1 = $xMin; $gl.Y1 = $lvl.Y; $gl.X2 = $xMax; $gl.Y2 = $lvl.Y
-        $gl.Stroke = $B.Track; $gl.StrokeThickness = 0.8; $gl.StrokeDashArray = $gridDash
+        $gl.Stroke = $B.Track; $gl.StrokeThickness = 0.8; $gl.StrokeDashArray = $DashGrid
         $null = $c.Children.Add($gl)
 
         $lbl = New-Text $lvl.Label $B.Muted 8
@@ -2357,7 +2458,7 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
     $ideal = [Windows.Shapes.Line]::new()
     $ideal.X1 = $xMin; $ideal.Y1 = $yBottom; $ideal.X2 = $xMax; $ideal.Y2 = $yTop
     $ideal.Stroke = $B.Tick; $ideal.StrokeThickness = 1.0
-    $ideal.StrokeDashArray = [Windows.Media.DoubleCollection]::Parse('3,2')
+    $ideal.StrokeDashArray = $DashIdeal
     $null = $c.Children.Add($ideal)
 
     # History points
@@ -2424,7 +2525,7 @@ function New-BurndownChart($r, $w, [DateTimeOffset]$Now, [string]$sev, $titleBru
         $fcLine = [Windows.Shapes.Line]::new()
         $fcLine.X1 = $xNow; $fcLine.Y1 = $yNow
         $fcLine.StrokeThickness = 1.5
-        $fcLine.StrokeDashArray = [Windows.Media.DoubleCollection]::Parse('2,2')
+        $fcLine.StrokeDashArray = $DashGrid
         $fcColor = if ($f.RunsOut) { if ($f.Level -eq 'alert') { $B.Bad } else { $B.Warn } } else { $B.Ok }
         $fcLine.Stroke = $fcColor
 
@@ -2620,7 +2721,7 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now, $TitleBrush = $null) {
         $full = [Windows.Controls.Border]::new()
         $full.Background = $B.Bad; $full.CornerRadius = 3; $full.Padding = '6,2'; $full.Margin = '0,3,0,0'
         $full.HorizontalAlignment = 'Left'
-        $label = New-Text ($Sym.Times + ' LIMIT REACHED') (New-Brush '#FFFFFFFF') 11
+        $label = New-Text ($Sym.Times + ' LIMIT REACHED') $WhiteBrush 11
         $label.FontWeight = [Windows.FontWeights]::Bold
         $full.Child = $label
         [Windows.Automation.AutomationProperties]::SetName($full, ($r.Name + ' ' + $w.Label + ': limit reached, 100 percent used'))
@@ -2813,7 +2914,7 @@ $SignalHeight = 22.0
 $SignalWidth = 6.0
 $SignalUsed = $SB.Bad                                                             # red = used
 $SignalLeft = New-Brush $(if ($lightTaskbar) { '#40000000' } else { '#5CFFFFFF' })   # grey = remaining
-$AlertText = New-Brush '#FFFFFFFF'
+$AlertText = $WhiteBrush
 
 # One vertical "signal" bar: red fill = % used, grey = remaining, white line = even
 # pace. Below it a tiny "5h" / "7d" label in the tool's colour (red when the
@@ -2996,12 +3097,13 @@ function Get-Rect([IntPtr]$h) {
     $r
 }
 
+$script:fgClassBuf = [Text.StringBuilder]::new(64)
 function Test-FullscreenForeground($Screen) {
     $fg = [QuotaBurndown.Native]::GetForegroundWindow()
     if ($fg -eq [IntPtr]::Zero) { return $false }
-    $sb = New-Object Text.StringBuilder 64
-    $null = [QuotaBurndown.Native]::GetClassName($fg, $sb, 64)
-    if (@('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd') -contains $sb.ToString()) { return $false }
+    $null = $script:fgClassBuf.Clear()
+    $null = [QuotaBurndown.Native]::GetClassName($fg, $script:fgClassBuf, 64)
+    if (@('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd') -contains $script:fgClassBuf.ToString()) { return $false }
     $r = Get-Rect $fg
     $r -and $r.Left -le $Screen.Left -and $r.Top -le $Screen.Top -and $r.Right -ge $Screen.Right -and $r.Bottom -ge $Screen.Bottom
 }
@@ -3023,7 +3125,15 @@ function Get-Taskbars {
 }
 
 function Update-StripPlacement {
-    $bars = if ($Settings.StripVisible) { Get-Taskbars } else { @() }
+    if (-not $Settings.StripVisible) {
+        for ($i = $script:strips.Count - 1; $i -ge 1; $i--) {
+            if ($script:stripDrag -and $script:stripDrag.Strip -eq $script:strips[$i]) { $script:stripDrag = $null }
+            $script:strips[$i].Window.Close(); $script:strips.RemoveAt($i)
+        }
+        if ($script:strips.Count -gt 0 -and $script:strips[0].Window.IsVisible) { $script:strips[0].Window.Hide() }
+        return
+    }
+    $bars = Get-Taskbars
     $want = [Math]::Max(1, $bars.Count)
     $added = $false
     while ($script:strips.Count -lt $want) { $null = $script:strips.Add((New-StripWindow)); $added = $true }
@@ -3083,7 +3193,7 @@ $script:stripDrag = $null
 # The tray icon is just the app logo; the numbers live in its tooltip.
 $tray = [Windows.Forms.NotifyIcon]::new()
 $IconPath = Join-Path $DataDir 'quota-burndown.ico'
-try { Save-LogoIcon $IconPath } catch { Write-WidgetLog "Logo: $_" }
+if (-not (Test-Path $IconPath)) { try { Save-LogoIcon $IconPath } catch { Write-WidgetLog "Logo: $_" } }
 if (Test-Path $IconPath) { $tray.Icon = [Drawing.Icon]::new($IconPath, [Windows.Forms.SystemInformation]::SmallIconSize) }
 
 function Get-TrayText($Results, [DateTimeOffset]$Now) {
@@ -3195,7 +3305,10 @@ function Save-Position {
 }
 
 function Show-Widget([bool]$Show) {
-    if ($Show) { $window.Show(); $null = $window.Activate() } else { Save-Position; $window.Hide() }
+    if ($Show) {
+        if ($script:cardDirty) { Update-CardView }
+        $window.Show(); $null = $window.Activate()
+    } else { Save-Position; $window.Hide() }
     $Settings.Visible = $Show
     Save-Settings $Settings
     Update-Strip
@@ -3315,13 +3428,23 @@ $window.Add_Loaded({
 
 $script:shownVersion = -1
 $script:lastRender = [DateTime]::MinValue
+$script:cardDirty = $false
 
-function Update-View {
+function Update-CardView {
     $root.Children.Clear()
     Add-ProviderSection $sync.Claude $true
     Add-ProviderSection $sync.Codex $false
     Add-ProviderSection $sync.Gemini $false
     Update-UpdateLink
+    $script:cardDirty = $false
+}
+
+function Update-View {
+    if ($window.IsVisible -or $Snapshot -or $root.Children.Count -eq 0) {
+        Update-CardView
+    } else {
+        $script:cardDirty = $true
+    }
     Update-Strip
     Update-Tray
     Update-BankedResetNotifications
