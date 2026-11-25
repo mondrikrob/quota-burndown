@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+﻿#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 # Unit tests for QuotaBurndown.ps1. The script is never run: its functions are
 # loaded from the parsed source (the $DataLayer block plus a few named functions).
 #   Invoke-Pester -Path .\tests
@@ -497,12 +497,32 @@ Describe 'Model prices and token accounting' {
         (Get-ClaudePrice 'claude-opus-4-5')[1] | Should -Be 5
         (Get-ClaudePrice 'claude-sonnet-5-5')[5] | Should -Be 0.10
         (Get-ClaudePrice 'claude-haiku-5-5')[1] | Should -Be 1.0
+        (Get-ClaudePrice 'claude-3-7-sonnet')[1] | Should -Be 3.0
+        (Get-ClaudePrice 'claude-3-opus')[1] | Should -Be 15.0
         (Get-CodexPrice 'codex-auto-review')[1] | Should -Be 0
+        (Get-CodexPrice 'gpt-5.6-sol')[1] | Should -Be 2.0
+        (Get-CodexPrice 'gpt-6.1-terra')[1] | Should -Be 2.0
+        (Get-CodexPrice 'gpt-6.2-astra')[1] | Should -Be 8.0
+        (Get-CodexPrice 'gpt-6.2-astra')[2] | Should -Be 0.40
+        (Get-CodexPrice 'gpt-6.2-astra')[3] | Should -Be 40.0
+        (Get-CodexPrice 'gpt-6.2-sol')[1] | Should -Be 2.0
+        (Get-CodexPrice 'gpt-6.2-terra')[1] | Should -Be 1.0
+        (Get-CodexPrice 'gpt-6.2-luna')[1] | Should -Be 0.10
+        (Get-CodexPrice 'gpt-4o')[1] | Should -Be 2.50
+        (Get-CodexPrice 'o1-mini')[1] | Should -Be 1.10
     }
     It 'prices Gemini models and subscription plans accurately' {
+        (Get-GeminiPrice 'Gemini 4 Neon (High)')[1] | Should -Be 3.00
+        (Get-GeminiPrice 'Gemini 4 Neon (Medium)')[2] | Should -Be 0.15
+        (Get-GeminiPrice 'Gemini 4 Neon (Medium)')[3] | Should -Be 15.00
+        (Get-GeminiPrice 'Gemini 4 Carbon (Medium)')[1] | Should -Be 2.00
+        (Get-GeminiPrice 'Gemini 4 Carbon (Medium)')[3] | Should -Be 10.00
         (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[1] | Should -Be 2.00
         (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[2] | Should -Be 0.10
         (Get-GeminiPrice 'Gemini 4 Argon (Medium)')[3] | Should -Be 10.00
+        (Get-GeminiPrice 'Gemini 4 Hydrogen (Medium)')[1] | Should -Be 1.50
+        (Get-GeminiPrice 'Gemini 4 Hydrogen (Medium)')[2] | Should -Be 0.075
+        (Get-GeminiPrice 'Gemini 4 Hydrogen (Medium)')[3] | Should -Be 7.50
         (Get-GeminiPrice 'gemini-3.8-flash')[1] | Should -Be 0.75
         (Get-GeminiPrice 'gemini-3.8-flash')[3] | Should -Be 3.75
         (Get-PlanUsdPerMonth 'Gemini' 'pro') | Should -Be 20
@@ -530,7 +550,9 @@ Describe 'Model prices and token accounting' {
         $sum = Measure-CodexTokens $st $now.AddHours(-1)
         $sum.Total | Should -Be 110
         $sum.Unpriced | Should -Be 110
+        $sum.UnpricedModels['unknown'] | Should -Be 110
         $sum.Cost | Should -Be 0
+        (Format-UnpricedModels $sum) | Should -Be '  unknown: 110'
     }
     It 'formats since date strings cleanly for today, this week, and older dates' {
         $now = [DateTimeOffset]::Parse('2026-10-21T12:00:00Z')
@@ -643,6 +665,103 @@ Describe 'Gemini quota and token parsing' {
         [Math]::Round($parsed.Windows[1].Percent, 2) | Should -Be 0.47
         $parsed.Windows[2].Label | Should -Be ('Weekly ' + [char]0x00B7 + ' Argon')
         [Math]::Round($parsed.Windows[2].Percent, 2) | Should -Be 70.19
+    }
+
+    It 'discovers Antigravity language server ports when State is not reported as Listen' {
+        $savedEndpoint = $script:geminiEndpoint
+        $script:geminiEndpoint = $null
+        try {
+            Mock Get-CimInstance {
+                [pscustomobject]@{
+                    ProcessId = 99999
+                    CommandLine = 'language_server.exe --csrf_token test-csrf-token-12345'
+                }
+            } -ParameterFilter { $Filter -like "*language_server*" }
+
+            Mock Get-NetTCPConnection { @() } -ParameterFilter { $State -eq 'Listen' }
+            Mock Get-NetTCPConnection {
+                @(
+                    [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 59494; RemoteAddress = '0.0.0.0'; RemotePort = 0; State = 0; OwningProcess = 99999 }
+                )
+            } -ParameterFilter { $State -ne 'Listen' }
+
+            Mock Invoke-AntigravityRpc {
+                if ($Port -eq 59494 -and $Csrf -eq 'test-csrf-token-12345' -and $Method -eq 'GetUserStatus') {
+                    [pscustomobject]@{ Scheme = 'http'; Payload = [pscustomobject]@{ userStatus = [pscustomobject]@{ planStatus = [pscustomobject]@{ planInfo = [pscustomobject]@{ planName = 'Pro' } } } } }
+                } elseif ($Port -eq 59494 -and $Csrf -eq 'test-csrf-token-12345' -and $Method -eq 'RetrieveUserQuotaSummary') {
+                    $rw = [DateTimeOffset]::UtcNow.AddDays(5).ToString('o')
+                    [pscustomobject]@{ Scheme = 'http'; Payload = [pscustomobject]@{
+                        response = [pscustomobject]@{
+                            groups = @(
+                                [pscustomobject]@{
+                                    displayName = 'Gemini Models'
+                                    buckets = @([pscustomobject]@{ bucketId = 'gemini-5h'; window = '5h'; remainingFraction = 0.9; resetTime = $rw })
+                                }
+                            )
+                        }
+                    } }
+                } else { $null }
+            }
+
+            $live = Get-GeminiLive
+            $live.Plan | Should -Be 'Pro'
+            $live.Windows | Should -HaveCount 1
+            $live.Windows[0].Label | Should -Be '5-hour'
+            [Math]::Round($live.Windows[0].Percent, 1) | Should -Be 10.0
+            $script:geminiEndpoint.Port | Should -Be 59494
+        } finally {
+            $script:geminiEndpoint = $savedEndpoint
+        }
+    }
+
+    It 'discovers Antigravity language server port and CSRF token from daemon JSON when --csrf_token is omitted' {
+        $savedEndpoint = $script:geminiEndpoint
+        $savedGeminiDir = (Get-Item Function:\Get-GeminiDir).ScriptBlock
+        $script:geminiEndpoint = $null
+        try {
+            function Get-GeminiDir { $TestDrive }
+            $daemonDir = Join-Path $TestDrive 'antigravity\daemon'
+            $null = New-Item -ItemType Directory -Force $daemonDir
+            Set-Content (Join-Path $daemonDir 'hub_56259.json') '{"pid":68452,"httpsPort":56258,"httpPort":56259,"lsVersion":"2.35.1","csrfToken":"daemon-csrf-token-999"}'
+            Set-Content (Join-Path $daemonDir 'hub_11111.json') '{"pid":11111,"httpsPort":11110,"httpPort":11111,"lsVersion":"2.35.0","csrfToken":"stale-token"}'
+
+            Mock Get-CimInstance {
+                [pscustomobject]@{
+                    ProcessId = 68452
+                    CommandLine = 'language_server.exe --standalone --override_ide_name antigravity --override_ide_version 2.35.1 --read_host_bridge_token_from_stdin'
+                }
+            } -ParameterFilter { $Filter -like "*language_server*" }
+
+            Mock Invoke-AntigravityRpc {
+                if ($Port -eq 56259 -and $Csrf -eq 'daemon-csrf-token-999' -and $PreferredScheme -eq 'http' -and $Method -eq 'GetUserStatus') {
+                    [pscustomobject]@{ Scheme = 'http'; Payload = [pscustomobject]@{ userStatus = [pscustomobject]@{ planStatus = [pscustomobject]@{ planInfo = [pscustomobject]@{ planName = 'Pro' } } } } }
+                } elseif ($Port -eq 56259 -and $Csrf -eq 'daemon-csrf-token-999' -and $PreferredScheme -eq 'http' -and $Method -eq 'RetrieveUserQuotaSummary') {
+                    $rw = [DateTimeOffset]::UtcNow.AddDays(6).ToString('o')
+                    [pscustomobject]@{ Scheme = 'http'; Payload = [pscustomobject]@{
+                        response = [pscustomobject]@{
+                            groups = @(
+                                [pscustomobject]@{
+                                    displayName = 'Gemini Models'
+                                    buckets = @([pscustomobject]@{ bucketId = 'gemini-weekly'; window = 'weekly'; remainingFraction = 0.96; resetTime = $rw })
+                                }
+                            )
+                        }
+                    } }
+                } else { $null }
+            }
+
+            $live = Get-GeminiLive
+            $live.Plan | Should -Be 'Pro'
+            $live.Windows | Should -HaveCount 1
+            $live.Windows[0].Label | Should -Be 'Weekly'
+            [Math]::Round($live.Windows[0].Percent, 1) | Should -Be 4.0
+            $script:geminiEndpoint.Port | Should -Be 56259
+            $script:geminiEndpoint.Csrf | Should -Be 'daemon-csrf-token-999'
+            $script:geminiEndpoint.Scheme | Should -Be 'http'
+        } finally {
+            $script:geminiEndpoint = $savedEndpoint
+            Set-Item Function:\Get-GeminiDir -Value $savedGeminiDir
+        }
     }
 
     It 'parses Antigravity transcript token steps, tracks Model Selection, and ignores non-Gemini models' {

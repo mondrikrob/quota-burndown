@@ -58,13 +58,14 @@ param(
     [switch]$Once,
     [switch]$Install,
     [switch]$Uninstall,
+    [switch]$Startup,
     [string]$Snapshot,
     [ValidateSet('', 'light', 'dark')][string]$Theme = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
-$AppVersion = '1.11.0'
+$AppVersion = '1.12.0'
 
 if (([int]$Once.IsPresent + [int]$Install.IsPresent + [int]$Uninstall.IsPresent + [int][bool]$Snapshot) -gt 1) {
     throw 'Choose only one of -Once, -Install, -Uninstall or -Snapshot.'
@@ -152,6 +153,10 @@ function Save-Settings($s) {
 # ===========================================================================
 
 $DataLayer = {
+    Add-Type -AssemblyName System.Net.Http
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
 
     function Get-DataFile([string]$Name) { Join-Path (Join-Path $HOME '.quota-burndown') $Name }
 
@@ -1003,7 +1008,7 @@ namespace QuotaBurndown {
                 }
             }
             $client = [Net.Http.HttpClient]::new($handler)
-            $client.Timeout = [TimeSpan]::FromSeconds(4)
+            $client.Timeout = if ($PreferredScheme) { [TimeSpan]::FromSeconds(4) } else { [TimeSpan]::FromSeconds(2) }
             $client.MaxResponseContentBufferSize = 2MB
             $req = $null; $res = $null
             try {
@@ -1011,6 +1016,7 @@ namespace QuotaBurndown {
                 $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
                 $null = $req.Headers.TryAddWithoutValidation('Connect-Protocol-Version', '1')
                 $null = $req.Headers.TryAddWithoutValidation('x-codeium-csrf-token', $Csrf)
+                $null = $req.Headers.TryAddWithoutValidation('x-antigravity-csrf-token', $Csrf)
                 $req.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
                 $res = $client.SendAsync($req).GetAwaiter().GetResult()
                 if ([int]$res.StatusCode -eq 200) {
@@ -1040,15 +1046,86 @@ namespace QuotaBurndown {
             $script:geminiEndpoint = $null
         }
         $procs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'language_server%'" -ErrorAction SilentlyContinue)
+        if ($procs.Count -eq 0) {
+            $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'language_server' -and ($_.CommandLine -match '--csrf_token' -or $_.CommandLine -match 'antigravity') })
+        }
         if ($procs.Count -eq 0) { throw 'Antigravity language server is not running' }
         $lastErr = 'Antigravity language server port not found'
+        $runningPids = @{}
+        foreach ($p in $procs) { $runningPids[[int]$p.ProcessId] = $true }
+        $daemonDir = Join-Path (Get-GeminiDir) 'antigravity\daemon'
+        if (Test-Path -LiteralPath $daemonDir) {
+            $daemonFiles = @(Get-ChildItem -LiteralPath $daemonDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTimeUtc -Descending)
+            foreach ($df in $daemonFiles) {
+                $meta = $null
+                try { $meta = Get-Content -LiteralPath $df.FullName -Raw -ErrorAction Stop | ConvertFrom-Json } catch { continue }
+                if (-not $meta -or $null -eq $meta.pid) { continue }
+                $dPid = 0
+                if (-not [int]::TryParse([string]$meta.pid, [ref]$dPid) -or -not $runningPids.ContainsKey($dPid)) { continue }
+                $csrf = [string]$meta.csrfToken
+                if (-not $csrf -or $csrf.Length -gt 512 -or $csrf -notmatch '^[A-Za-z0-9._~+/-]+=*$') { continue }
+                $targets = @()
+                $hp = 0
+                if ($null -ne $meta.httpPort -and [int]::TryParse([string]$meta.httpPort, [ref]$hp) -and $hp -gt 0 -and $hp -le 65535) {
+                    $targets += [pscustomobject]@{ Port = $hp; Scheme = 'http' }
+                }
+                $hsp = 0
+                if ($null -ne $meta.httpsPort -and [int]::TryParse([string]$meta.httpsPort, [ref]$hsp) -and $hsp -gt 0 -and $hsp -le 65535) {
+                    $targets += [pscustomobject]@{ Port = $hsp; Scheme = 'https' }
+                }
+                foreach ($t in $targets) {
+                    $statusRes = Invoke-AntigravityRpc $t.Port $csrf 'GetUserStatus' $t.Scheme
+                    $scheme = if ($statusRes) { $statusRes.Scheme } else { $t.Scheme }
+                    $summaryRes = Invoke-AntigravityRpc $t.Port $csrf 'RetrieveUserQuotaSummary' $scheme
+                    $statusObj = if ($statusRes) { $statusRes.Payload } else { $null }
+                    $summaryObj = if ($summaryRes) { $summaryRes.Payload } else { $null }
+                    if ($statusObj -or $summaryObj) {
+                        try {
+                            $parsed = ConvertFrom-GeminiPayload $statusObj $summaryObj
+                            $script:geminiEndpoint = @{ Port = $t.Port; Csrf = $csrf; Scheme = $(if ($summaryRes) { $summaryRes.Scheme } else { $scheme }) }
+                            return $parsed
+                        } catch { $lastErr = $_.Exception.Message }
+                    }
+                }
+            }
+        }
         foreach ($p in $procs) {
             $cmd = [string]$p.CommandLine
             if ($cmd -notmatch '--csrf_token[=\s]+([^\s"]+)') { continue }
             $csrf = $Matches[1]
             if ($csrf.Length -gt 512 -or $csrf -notmatch '^[A-Za-z0-9._~+/-]+=*$') { continue }
             $conns = @(Get-NetTCPConnection -OwningProcess $p.ProcessId -State Listen -ErrorAction SilentlyContinue)
-            $ports = @($conns | Select-Object -ExpandProperty LocalPort -Unique)
+            if ($conns.Count -eq 0) {
+                $conns = @(Get-NetTCPConnection -OwningProcess $p.ProcessId -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LocalAddress -in '127.0.0.1', '::1' -and ($_.State -eq 'Listen' -or $_.RemotePort -eq 0) })
+            }
+            if ($conns.Count -eq 0) {
+                $conns = @(Get-NetTCPConnection -OwningProcess $p.ProcessId -ErrorAction SilentlyContinue |
+                    Where-Object { ($_.LocalAddress -in '127.0.0.1', '::1', '0.0.0.0', '::') -and ($_.State -eq 'Listen' -or $_.RemotePort -eq 0) })
+            }
+            if ($conns.Count -eq 0) {
+                $conns = @(Get-NetTCPConnection -OwningProcess $p.ProcessId -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LocalAddress -in '127.0.0.1', '::1' })
+            }
+            $ports = @($conns |
+                Sort-Object @{ Expression = { if ($_.LocalAddress -in '127.0.0.1', '::1') { 0 } else { 1 } } } |
+                Select-Object -ExpandProperty LocalPort -Unique)
+            if ($ports.Count -eq 0) {
+                $lines = @(netstat -ano -p tcp 2>$null)
+                $pidStr = [string]$p.ProcessId
+                $netstatPorts = @()
+                foreach ($line in $lines) {
+                    if ($line -match '^\s*TCP\s+(?:127\.0\.0\.1|\[::1\]):(\d+)\s+.*?\s+' + $pidStr + '\s*$') {
+                        $netstatPorts += [int]$Matches[1]
+                    }
+                }
+                $ports = @($netstatPorts | Select-Object -Unique)
+            }
+            if ($cmd -match '--(?:https?_server_)?port[=\s]+(\d+)' -and [int]$Matches[1] -gt 0) {
+                $explicitPort = [int]$Matches[1]
+                $ports = @($explicitPort) + @($ports | Where-Object { $_ -ne $explicitPort })
+            }
             foreach ($port in $ports) {
                 $statusRes = Invoke-AntigravityRpc $port $csrf 'GetUserStatus'
                 $scheme = if ($statusRes) { $statusRes.Scheme } else { '' }
@@ -1154,7 +1231,7 @@ namespace QuotaBurndown {
     }
 
     # ----- prices -----------------------------------------------------------
-    # API list prices in USD per million tokens (checked 2026-10-16). Used only to
+    # API list prices in USD per million tokens (checked 2026-11-25). Used only to
     # estimate what your usage would have cost on the pay-as-you-go API.
     # Sources: https://platform.claude.com/docs/en/about-claude/pricing
     #          https://developers.openai.com/api/docs/pricing
@@ -1171,6 +1248,7 @@ namespace QuotaBurndown {
         if (-not $script:claudePriceTable) {
             # model prefix, input, output, 5-minute cache write, 1-hour cache write, cache read
             $script:claudePriceTable = @(
+                @('claude-fable-5-2', 8, 40, 10, 16, 0.20), @('claude-mythos-5-2', 8, 40, 10, 16, 0.20),
                 @('claude-fable-5-1', 10, 50, 12.5, 20, 0.25), @('claude-mythos-5-1', 10, 50, 12.5, 20, 0.25),
                 @('claude-fable-5', 10, 50, 12.5, 20, 1.0), @('claude-mythos-5', 10, 50, 12.5, 20, 1.0),
                 @('claude-opus-5-5', 4, 20, 5, 8, 0.20), @('claude-opus-5', 5, 25, 6.25, 10, 0.50),
@@ -1182,11 +1260,14 @@ namespace QuotaBurndown {
                 @('claude-sonnet-4-6', 3, 15, 3.75, 6, 0.30), @('claude-sonnet-4-5', 3, 15, 3.75, 6, 0.30),
                 @('claude-sonnet-4', 3, 15, 3.75, 6, 0.30),
                 @('claude-haiku-5-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-5', 1, 5, 1.25, 2, 0.10),
-                @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08)
+                @('claude-haiku-4-5', 1, 5, 1.25, 2, 0.10), @('claude-haiku-3-5', 0.80, 4, 1, 1.60, 0.08),
+                @('claude-3-7-sonnet', 3, 15, 3.75, 6, 0.30), @('claude-3-5-sonnet', 3, 15, 3.75, 6, 0.30),
+                @('claude-3-5-haiku', 0.80, 4, 1, 1.60, 0.08), @('claude-3-opus', 15, 75, 18.75, 30, 1.50),
+                @('claude-3-haiku', 0.25, 1.25, 0.30, 0.50, 0.03)
             )
         }
         foreach ($row in $script:claudePriceTable) {
-            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{8}$')) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-(preview|latest|\d{4}-\d{2}-\d{2}|\d{8})$')) {
                 $script:claudePriceCache[$Model] = $row
                 return , $row
             }
@@ -1206,12 +1287,28 @@ namespace QuotaBurndown {
         if (-not $script:codexPriceTable) {
             # model prefix, input, cached input, output
             $script:codexPriceTable = @(
-                @('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-astra', 10, 1, 50), @('gpt-6-luna', 0.10, 0.01, 0.50), @('gpt-5.5', 5, 0.50, 30),
+                @('gpt-6.2-sol', 2, 0.10, 10),
+                @('gpt-6.1-sol', 2, 0.10, 10), @('gpt-6-sol', 2, 0.10, 10),
+                @('gpt-5.6-sol', 2, 0.10, 10), @('gpt-5.5-sol', 2, 0.10, 10), @('gpt-5-sol', 2, 0.10, 10),
+                @('gpt-6.2-terra', 1, 0.05, 5),
+                @('gpt-6.1-terra', 2, 0.10, 10), @('gpt-6-terra', 2, 0.10, 10),
+                @('gpt-5.6-terra', 2, 0.10, 10), @('gpt-5-terra', 2, 0.10, 10),
+                @('gpt-6.2-astra', 8, 0.40, 40),
+                @('gpt-6.1-astra', 10, 1, 50), @('gpt-6-astra', 10, 1, 50),
+                @('gpt-5.6-astra', 10, 1, 50), @('gpt-5-astra', 10, 1, 50),
+                @('gpt-6.2-luna', 0.10, 0.01, 0.50),
+                @('gpt-6.1-luna', 0.10, 0.01, 0.50), @('gpt-6-luna', 0.10, 0.01, 0.50),
+                @('gpt-5.6-luna', 0.10, 0.01, 0.50), @('gpt-5-luna', 0.10, 0.01, 0.50),
+                @('gpt-5.5', 5, 0.50, 30), @('gpt-5.1', 5, 0.50, 30), @('gpt-5', 5, 0.50, 30),
+                @('gpt-4.5-preview', 75, 37.5, 150), @('gpt-4.5', 75, 37.5, 150),
+                @('gpt-4o-mini', 0.15, 0.075, 0.60), @('gpt-4o', 2.50, 1.25, 10),
+                @('o1-preview', 15, 7.50, 60), @('o1-mini', 1.10, 0.55, 4.40), @('o1', 15, 7.50, 60),
+                @('o3-mini', 1.10, 0.55, 4.40), @('o3', 2, 0.10, 10), @('o4-mini', 1.10, 0.55, 4.40),
                 @('codex-auto-review', 0, 0, 0)
             )
         }
         foreach ($row in $script:codexPriceTable) {
-            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-\d{4}-\d{2}-\d{2}$')) {
+            if ($Model -eq $row[0] -or $Model -match ('^' + [regex]::Escape($row[0]) + '-(preview|latest|\d{4}-\d{2}-\d{2}|\d{8})$')) {
                 $script:codexPriceCache[$Model] = $row
                 return , $row
             }
@@ -1233,12 +1330,16 @@ namespace QuotaBurndown {
         if (-not $script:geminiPriceTable) {
             # model prefix, input, cached input, output
             $script:geminiPriceTable = @(
-                @('gemini-4-argon', 2.0, 0.10, 10.0), @('gemini-4-pro', 2.0, 0.10, 10.0),
+                @('gemini-4-neon', 3.0, 0.15, 15.0), @('gemini-4-carbon', 2.0, 0.10, 10.0),
+                @('gemini-4-argon', 2.0, 0.10, 10.0), @('gemini-4-hydrogen', 1.50, 0.075, 7.50),
+                @('gemini-4-pro', 2.0, 0.10, 10.0),
                 @('gemini-3.8-flash', 0.75, 0.075, 3.75), @('gemini-3.7-flash', 0.75, 0.075, 3.75), @('gemini-3.6-flash', 0.75, 0.075, 3.75),
                 @('gemini-3.5-flash-lite', 0.30, 0.03, 2.50), @('gemini-3.5-flash', 1.50, 0.15, 9.0),
                 @('gemini-3.1-pro', 2.0, 0.20, 12.0), @('gemini-3-pro', 2.0, 0.20, 12.0),
                 @('gemini-3.1-flash-lite', 0.25, 0.025, 1.50), @('gemini-3-flash', 0.50, 0.05, 3.0),
-                @('gemini-2.5-pro', 1.25, 0.125, 10.0), @('gemini-2.5-flash-lite', 0.10, 0.01, 0.40), @('gemini-2.5-flash', 0.30, 0.03, 2.50)
+                @('gemini-2.5-pro', 1.25, 0.125, 10.0), @('gemini-2.5-flash-lite', 0.10, 0.01, 0.40), @('gemini-2.5-flash', 0.30, 0.03, 2.50),
+                @('gemini-2.0-flash-lite', 0.075, 0.02, 0.30), @('gemini-2.0-flash', 0.10, 0.025, 0.40),
+                @('gemini-1.5-pro', 1.25, 0.30, 5.0), @('gemini-1.5-flash', 0.075, 0.01875, 0.30)
             )
         }
         foreach ($row in $script:geminiPriceTable) {
@@ -1301,7 +1402,23 @@ namespace QuotaBurndown {
         if ($m.Success) { [long]$m.Groups[1].Value } else { [long]0 }
     }
 
-    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0; Unpriced = [long]0; Since = $null; LastReset = $null; IsMidWindow = $false; SinceReset = $null } }
+    function New-TokenSum { [pscustomobject]@{ Input = [long]0; Output = [long]0; CacheWrite = [long]0; CacheRead = [long]0; Total = [long]0; Cost = [double]0; Unpriced = [long]0; UnpricedModels = @{}; Since = $null; LastReset = $null; IsMidWindow = $false; SinceReset = $null } }
+
+    # Counts unpriced tokens per model name, so the UI can say which prices are missing.
+    function Add-Unpriced($Sum, [string]$Model, [long]$Tokens) {
+        if ($Tokens -le 0) { return }
+        if (-not $Model) { $Model = '(no model name)' }
+        $Sum.Unpriced += $Tokens
+        $Sum.UnpricedModels[$Model] = [long]$Sum.UnpricedModels[$Model] + $Tokens
+    }
+
+    # Lines like "  gpt-7-sol: 12.3M" for the largest unpriced models.
+    function Format-UnpricedModels($Sum, [int]$Top = 5) {
+        $list = @($Sum.UnpricedModels.GetEnumerator() | Sort-Object Value -Descending)
+        $lines = @($list | Select-Object -First $Top | ForEach-Object { '  {0}: {1}' -f $_.Key, (Format-Tokens $_.Value) })
+        if ($list.Count -gt $Top) { $lines += '  ...and {0} more' -f ($list.Count - $Top) }
+        $lines
+    }
 
     function Update-ClaudeTokens($State) {
         $root = Join-Path (Get-ClaudeDir) 'projects'
@@ -1329,6 +1446,7 @@ namespace QuotaBurndown {
                 $e = [pscustomobject]@{
                     Id         = $(if ($id.Success) { $id.Groups[1].Value } else { $null })
                     At         = $at
+                    Model      = $(if ($model.Success) { $model.Groups[1].Value } else { '' })
                     Input      = Get-UsageField $u 'input_tokens'
                     CacheWrite = Get-UsageField $u 'cache_creation_input_tokens'
                     CacheRead  = Get-UsageField $u 'cache_read_input_tokens'
@@ -1338,7 +1456,7 @@ namespace QuotaBurndown {
                 }
                 $write1h = Get-UsageField $u 'ephemeral_1h_input_tokens'
                 $write5m = [Math]::Max([long]0, $e.CacheWrite - $write1h)
-                $p = Get-ClaudePrice $(if ($model.Success) { $model.Groups[1].Value } else { '' })
+                $p = Get-ClaudePrice $e.Model
                 if ($p) { $e.Cost = ($e.Input * $p[1] + $e.Output * $p[2] + $write5m * $p[3] + $write1h * $p[4] + $e.CacheRead * $p[5]) / 1e6 }
                 else { $e.Unpriced = $e.Input + $e.Output + $e.CacheWrite + $e.CacheRead }
                 $null = $entries.Add($e)
@@ -1363,10 +1481,10 @@ namespace QuotaBurndown {
         }
         $s = New-TokenSum; $s.Since = $Since
         foreach ($e in $byId.Values) {
-            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; Add-Unpriced $s $e.Model $e.Unpriced
         }
         foreach ($e in $anon) {
-            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheWrite += $e.CacheWrite; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; Add-Unpriced $s $e.Model $e.Unpriced
         }
         $s.Total = $s.Input + $s.Output + $s.CacheWrite + $s.CacheRead
         $s
@@ -1424,7 +1542,7 @@ namespace QuotaBurndown {
                 $s.Input += $inTok; $s.CacheRead += $cached; $s.Output += $output
                 $s.Total += $e.Total - $(if ($b) { $b.Total } else { 0 })
                 if ($p) { $s.Cost += ($inTok * $p[1] + $cached * $p[2] + $output * $p[3]) / 1e6 }
-                else { $s.Unpriced += $inTok + $cached + $output }
+                else { Add-Unpriced $s $e.Model ($inTok + $cached + $output) }
                 $prev = $e
             }
         }
@@ -1559,10 +1677,10 @@ namespace QuotaBurndown {
         }
         $s = New-TokenSum; $s.Since = $Since
         foreach ($e in $byId.Values) {
-            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; Add-Unpriced $s $e.Model $e.Unpriced
         }
         foreach ($e in $anon) {
-            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; $s.Unpriced += $e.Unpriced
+            $s.Input += $e.Input; $s.Output += $e.Output; $s.CacheRead += $e.CacheRead; $s.Cost += $e.Cost; Add-Unpriced $s $e.Model $e.Unpriced
         }
         $s.Total = $s.Input + $s.Output + $s.CacheRead
         $s
@@ -1993,7 +2111,7 @@ if ($Once) {
             $line = '  {0,-16} {1,5:0}%  resets {2:ddd HH:mm}' -f $w.Label, $w.Percent, $w.ResetsAt.LocalDateTime
             if ($t) {
                 $line += '  tokens {0,7}  ~{1} API' -f (Format-Tokens $t.Total), (Format-Usd $t.Cost)
-                if ($t.Unpriced -gt 0) { $line += ' (priced subtotal; ' + (Format-Tokens $t.Unpriced) + ' tokens unpriced)' }
+                if ($t.Unpriced -gt 0) { $line += ' (priced subtotal; ' + (Format-Tokens $t.Unpriced) + ' tokens unpriced: ' + (@(Format-UnpricedModels $t 3) -replace '^\s+' -join ', ') + ')' }
             }
             if ($w.Percent -ge 100 -and $w.ResetsAt -gt [DateTimeOffset]::UtcNow) { $line += '  LIMIT REACHED' }
             elseif ($f -and $f.Level -eq 'alert') { $line += '  RUNS OUT ~{0:ddd HH:mm} ({1})' -f $f.HitAt.LocalDateTime, $f.Basis }
@@ -2010,15 +2128,16 @@ $StartMenuLink = Join-Path ([Environment]::GetFolderPath('Programs')) 'Quota Bur
 $InstalledScript = Join-Path $DataDir 'QuotaBurndown.ps1'
 $MutexName = 'Local\QuotaBurndown'
 $ExitEventName = 'Local\QuotaBurndown-Exit'
+$ShowEventName = 'Local\QuotaBurndown-Show'
 
-function New-LaunchShortcut([string]$Path, [string]$Script = $PSCommandPath) {
+function New-LaunchShortcut([string]$Path, [string]$Script = $PSCommandPath, [string]$ExtraArgs = '') {
     # conhost --headless keeps a console window from flashing up, even when
     # Windows Terminal is the default terminal host.
     $sh = New-Object -ComObject WScript.Shell
     $lnk = $sh.CreateShortcut($Path)
     $lnk.TargetPath = Join-Path $env:WINDIR 'System32\conhost.exe'
-    $lnk.Arguments = '--headless "{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}"' -f
-        (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'), $Script
+    $lnk.Arguments = '--headless "{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}"{2}' -f
+        (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'), $Script, $(if ($ExtraArgs) { ' ' + $ExtraArgs } else { '' })
     $lnk.WorkingDirectory = Split-Path $Script
     $ico = Join-Path $DataDir 'quota-burndown.ico'
     try { Save-LogoIcon $ico } catch { }
@@ -2099,7 +2218,7 @@ if ($Install) {
     Request-InstallChoices
     if ((Resolve-Path $PSCommandPath).Path -ne $InstalledScript) { Copy-Item $PSCommandPath $InstalledScript -Force }
     New-LaunchShortcut $StartMenuLink $InstalledScript
-    if ($Settings.StartWithWindows -eq $true -or (Test-Path $StartupLink)) { New-LaunchShortcut $StartupLink $InstalledScript }
+    if ($Settings.StartWithWindows -eq $true -or (Test-Path $StartupLink)) { New-LaunchShortcut $StartupLink $InstalledScript '-Startup' }
     # Launch through Explorer so the widget never inherits another app's sandbox.
     Start-Process explorer.exe -ArgumentList ('"{0}"' -f $StartMenuLink)
     Write-Output "Quota Burndown $AppVersion installed to $InstalledScript and started."
@@ -2124,8 +2243,16 @@ if ($Uninstall) {
 
 $mutex = [Threading.Mutex]::new($false, $MutexName)
 try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
-if (-not $Snapshot -and -not $owned) { return }
+if (-not $Snapshot -and -not $owned) {
+    $ev = $null
+    if ([Threading.EventWaitHandle]::TryOpenExisting($ShowEventName, [ref]$ev)) {
+        $null = $ev.Set()
+        $ev.Dispose()
+    }
+    return
+}
 $exitEvent = [Threading.EventWaitHandle]::new($false, 'AutoReset', $ExitEventName)
+$showEvent = [Threading.EventWaitHandle]::new($false, 'AutoReset', $ShowEventName)
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 if (-not ('QuotaBurndown.Native' -as [type])) {
@@ -2780,7 +2907,10 @@ function Add-WindowRow($r, $w, [DateTimeOffset]$Now, $TitleBrush = $null) {
             $tip += 'Tokens burned on this PC in this window: {0} (~{1} at API prices)' -f (Format-Tokens $tok.Total), (Format-Usd $tok.Cost)
         }
         $tip += '  input {0}, output {1}, cache write {2}, cache read {3}' -f (Format-Tokens $tok.Input), (Format-Tokens $tok.Output), (Format-Tokens $tok.CacheWrite), (Format-Tokens $tok.CacheRead)
-        if ($tok.Unpriced -gt 0) { $tip += (Format-Tokens $tok.Unpriced) + ' tokens have no known model price. The dollar amount is only the priced subtotal.' }
+        if ($tok.Unpriced -gt 0) {
+            $tip += (Format-Tokens $tok.Unpriced) + ' tokens have no known model price. The dollar amount is only the priced subtotal. No price for:'
+            $tip += Format-UnpricedModels $tok
+        }
     }
     $tip += ''
     $tip += 'The white tick on the bar marks the even pace.'
@@ -2798,7 +2928,16 @@ function Add-ProviderSection($r, [bool]$First) {
     $status = New-Text '' $B.Muted 11
     $status.VerticalAlignment = 'Bottom'
     if ($r.Loading) { $status.Text = 'loading' + $Sym.Ellipsis }
-    elseif ($r.Error) { $status.Text = $r.Error; $status.Foreground = $B.Warn }
+    elseif ($r.Error) {
+        $status.Text = $r.Error; $status.Foreground = $B.Warn
+        if ($r.Name -eq 'Claude Code' -and $r.Error -in $ClaudeLoginErrors) {
+            $status.Text += ' ' + $Sym.Dot + ' sign in'
+            $status.TextDecorations = [Windows.TextDecorations]::Underline
+            $status.Cursor = [Windows.Input.Cursors]::Hand
+            # Preview + Handled: the window's DragMove on mouse-down would swallow a plain click.
+            $status.Add_PreviewMouseLeftButtonDown({ param($s, $e) $e.Handled = $true; Start-ClaudeSignIn })
+        }
+    }
     elseif ($r.UpdatedAt) {
         $age = $now - $r.UpdatedAt
         $status.Text = if ($age.TotalMinutes -lt 1) { 'just now' } else { (Format-Span $age) + ' ago' }
@@ -2807,6 +2946,7 @@ function Add-ProviderSection($r, [bool]$First) {
     }
     $tips = @()
     if ($r.Detail) { $tips += $r.Detail }
+    if ($status.Cursor -eq [Windows.Input.Cursors]::Hand) { $tips += "Click to sign in (opens 'claude auth login')." }
     if ($r.UpdatedAt) { $tips += 'Last updated {0:ddd HH:mm}' -f $r.UpdatedAt.LocalDateTime }
     if ($tips.Count) { $status.ToolTip = ($tips -join "`n") }
     [Windows.Controls.DockPanel]::SetDock($status, 'Right')
@@ -2825,7 +2965,7 @@ function Add-ProviderSection($r, [bool]$First) {
         $resetLine.ToolTip = 'Click to open the usage page and apply a reset.'
         $resetLine.Cursor = [Windows.Input.Cursors]::Hand
         $resetLine.Tag = if ($r.Name -eq 'Claude Code') { 'https://claude.ai/settings/usage' } else { 'https://chatgpt.com/codex/settings/usage' }
-        $resetLine.Add_MouseLeftButtonUp({ param($s, $e) Start-Process $s.Tag; $e.Handled = $true })
+        $resetLine.Add_PreviewMouseLeftButtonDown({ param($s, $e) $e.Handled = $true; Start-Process $s.Tag })
         $null = $root.Children.Add($resetLine)
     }
 
@@ -2880,7 +3020,10 @@ function Add-ProviderSection($r, [bool]$First) {
             $settingPrefix = switch ($r.Name) { 'Claude Code' { 'Claude' } 'Gemini' { 'Gemini' } default { 'Codex' } }
             $tip += 'Set {0}PlanUsdPerMonth in settings.json to compare with your plan.' -f $settingPrefix
         }
-        if ($week.Unpriced -gt 0) { $tip += (Format-Tokens $week.Unpriced) + ' tokens have no known model price. The plan comparison is hidden until all tokens are priced.' }
+        if ($week.Unpriced -gt 0) {
+            $tip += (Format-Tokens $week.Unpriced) + ' tokens have no known model price. The plan comparison is hidden until all tokens are priced. No price for:'
+            $tip += Format-UnpricedModels $week
+        }
         $tip += switch ($r.Name) {
             'Claude Code' { "The % limits also count claude.ai chats and other devices; these tokens don't." }
             'Gemini'      { "The % limits are shared across Antigravity and Gemini CLI on your account; these tokens only count local Antigravity transcripts on this PC." }
@@ -3286,11 +3429,39 @@ function Update-BankedResetNotifications {
     } else {
         '{0} banked reset(s) expire within 24 hours, on {1:dd MMM HH:mm}. Click to open your usage page.' -f $resetEvent.Count, $resetEvent.ExpiresAt.LocalDateTime
     }
-    $script:resetNoticeUrl = if ($notice.Provider -eq 'Claude Code') { 'https://claude.ai/settings/usage' } else { 'https://chatgpt.com/codex/settings/usage' }
+    $script:noticeTarget = if ($notice.Provider -eq 'Claude Code') { 'https://claude.ai/settings/usage' } else { 'https://chatgpt.com/codex/settings/usage' }
     $tray.ShowBalloonTip(10000, ($notice.Provider + ' banked resets'), $body, [Windows.Forms.ToolTipIcon]::Info)
     $script:resetNoticeAt = $now
 }
-$tray.Add_BalloonTipClicked({ if ($script:resetNoticeUrl) { Start-Process $script:resetNoticeUrl } })
+
+$ClaudeLoginErrors = 'not signed in', 'login expired', 'login rejected', 'invalid login'
+
+# Opens a console running `claude auth login`; it opens the browser sign-in and closes when done.
+function Start-ClaudeSignIn {
+    $exe = Find-ClaudeExe
+    Write-WidgetLog ("Sign-in clicked; claude at '{0}'." -f $exe)
+    try {
+        if (-not $exe) { Start-Process 'https://docs.claude.com/en/docs/claude-code/setup'; return }
+        # cmd /k keeps the window open so you can read the result or any error.
+        Start-Process cmd.exe -ArgumentList ('/k ""{0}" auth login"' -f $exe)
+    } catch { Write-WidgetLog ('Could not start Claude sign-in: ' + $_.Exception.Message) }
+}
+
+# One notification per signed-out episode; it re-arms after a successful sign-in.
+$script:signInNoticeShown = $false
+function Update-SignInNotice {
+    if ($Snapshot) { return }
+    $needed = $sync.Claude -and $sync.Claude.Error -in $ClaudeLoginErrors
+    if ($needed -and -not $script:signInNoticeShown) {
+        $script:noticeTarget = 'claude-sign-in'
+        $tray.ShowBalloonTip(15000, 'Claude Code sign-in needed', ('Quota Burndown: {0}. Click here to sign in.' -f $sync.Claude.Error), [Windows.Forms.ToolTipIcon]::Warning)
+    }
+    $script:signInNoticeShown = [bool]$needed
+}
+$tray.Add_BalloonTipClicked({
+    if ($script:noticeTarget -eq 'claude-sign-in') { Start-ClaudeSignIn }
+    elseif ($script:noticeTarget) { Start-Process $script:noticeTarget }
+})
 
 # ----- actions & menus -------------------------------------------------------
 
@@ -3324,6 +3495,7 @@ function Exit-Widget {
     try { $null = $workerHandle.AsyncWaitHandle.WaitOne(3000) } catch { }
     try { $worker.Dispose(); $workerRunspace.Dispose() } catch { }
     try { $exitEvent.Dispose() } catch { }
+    try { $showEvent.Dispose() } catch { }
     try { $mutex.ReleaseMutex() } catch { }
     [Windows.Application]::Current.Shutdown()
 }
@@ -3448,6 +3620,7 @@ function Update-View {
     Update-Strip
     Update-Tray
     Update-BankedResetNotifications
+    Update-SignInNotice
     $script:lastRender = [DateTime]::UtcNow
 }
 
@@ -3456,6 +3629,7 @@ $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
         try {
             if ($exitEvent.WaitOne(0)) { Exit-Widget; return }
+            if ($showEvent.WaitOne(0)) { Show-Widget $true }
             $v = $sync.Version
             if ($v -ne $script:shownVersion -or ([DateTime]::UtcNow - $script:lastRender).TotalSeconds -ge 20) {
                 $script:shownVersion = $v
